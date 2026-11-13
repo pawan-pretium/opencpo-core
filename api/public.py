@@ -4,10 +4,13 @@ QR lookup, charger discovery, payment webhook, cert identity, and management.
 OTP auth: see api/public_auth.py
 Session management: see api/public_sessions.py
 """
+import hashlib
+import hmac
 import json
 import logging
 import os
 from datetime import datetime, timezone
+import time
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from typing import Optional
@@ -102,67 +105,83 @@ async def chargers_nearby(
     return {"chargers": chargers, "total": len(chargers)}
 
 
-# ── Payment Webhook (generic) ────────────────────────────────────────────
-# Operators plug in their own payment provider. This stub handles the common
-# flow: update payment_status, trigger RemoteStartTransaction on success.
+# ── Payment Webhook (Stripe) ─────────────────────────────────────────────
+# Only Stripe may change payment state. Every request must carry a valid
+# Stripe-Signature header made with STRIPE_WEBHOOK_SECRET. With no secret
+# configured, every request is rejected. There is no unsigned path.
+
+STRIPE_WEBHOOK_TOLERANCE_S = 300
+
+# Stripe event type -> payment_status written on the public session.
+_STRIPE_STATUS = {
+    "payment_intent.amount_capturable_updated": "authorized",
+    "payment_intent.payment_failed": "failed",
+    "payment_intent.canceled": "cancelled",
+}
+
+
+def _verify_stripe_signature(payload: bytes, header: str, secret: str) -> bool:
+    """Check a Stripe-Signature header (t=...,v1=...) against the raw body."""
+    if not secret or not header:
+        return False
+    timestamp = None
+    signatures: list[str] = []
+    for part in header.split(","):
+        key, _, value = part.strip().partition("=")
+        if key == "t":
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+    if not timestamp or not timestamp.isdigit() or not signatures:
+        return False
+    if abs(time.time() - int(timestamp)) > STRIPE_WEBHOOK_TOLERANCE_S:
+        return False
+    signed = timestamp.encode() + b"." + payload
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, sig) for sig in signatures)
+
 
 @webhook_router.post("/api/payments/webhook")
 async def payment_webhook(request: Request):
     """
-    Generic payment webhook handler.
+    Stripe webhook for the driver hold.
 
-    Expects JSON body: {"session_id": "<uuid>", "status": "paid"|"cancelled"|...}
-    Or form data: id=<payment_id> (legacy format — looks up by payment_id).
-
-    Payment provider adapters should call this after translating their native format.
-    Must always return 200 — providers retry on any other status.
+    A bad or missing signature returns 400 and changes nothing. A valid
+    event returns 200 even when no session matches, so Stripe does not retry.
     """
-    content_type = request.headers.get("content-type", "")
+    secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    payload = await request.body()
+    if not _verify_stripe_signature(payload, request.headers.get("stripe-signature", ""), secret):
+        logger.warning("Payment webhook: rejected request (missing or bad Stripe signature)")
+        raise HTTPException(status_code=400, detail="invalid signature")
 
-    if "application/x-www-form-urlencoded" in content_type:
-        # Legacy form data: look up by external payment ID
-        form = await request.form()
-        payment_id = form.get("id", "")
-        if not payment_id:
-            logger.warning("Payment webhook: missing payment id in form data")
-            return {"ok": True}
-        async with db.read() as conn:
-            row = await conn.fetchrow("""
-                SELECT id::text AS id, cp_id, connector_id, payment_status
-                  FROM ocpp.public_sessions
-                 WHERE external_payment_id = $1
-            """, payment_id)
-        if not row:
-            logger.warning("Payment webhook: no session for payment_id=%s", payment_id)
-            return {"ok": True}
-        session_id = row["id"]
-        logger.info("Payment webhook: payment_id=%s session=%s (no adapter configured)", payment_id, session_id[:8])
+    try:
+        event = json.loads(payload)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid json")
+    if not isinstance(event, dict):
+        raise HTTPException(status_code=400, detail="invalid event")
+
+    status = _STRIPE_STATUS.get(event.get("type", ""))
+    if status is None:
         return {"ok": True}
 
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            return {"ok": True}
-
-        session_id = body.get("session_id", "")
-        status = body.get("status", "")
-
-        if not session_id or not status:
-            logger.warning("Payment webhook: missing session_id or status in body")
-            return {"ok": True}
+    obj = (event.get("data") or {}).get("object") or {}
+    payment_intent_id = obj.get("id", "") if isinstance(obj, dict) else ""
+    if not payment_intent_id:
+        return {"ok": True}
 
     async with db.read() as conn:
         row = await conn.fetchrow("""
             SELECT id::text AS id, cp_id, connector_id, payment_status
               FROM ocpp.public_sessions
-             WHERE id = $1::uuid
-        """, session_id)
-
+             WHERE external_payment_id = $1
+        """, payment_intent_id)
     if not row:
-        logger.warning("Payment webhook: session %s not found", session_id)
+        logger.warning("Payment webhook: no session for payment_intent=%s", payment_intent_id)
         return {"ok": True}
 
+    session_id = row["id"]
     prev_status = row["payment_status"]
 
     async with db.write() as conn:
@@ -172,11 +191,13 @@ async def payment_webhook(request: Request):
              WHERE id = $1::uuid
         """, session_id, status)
 
-    logger.info("Session %s payment_status → %s", session_id[:8], status)
+    logger.info("Session %s payment_status → %s (%s)", session_id[:8], status, event.get("type"))
 
-    # Trigger RemoteStartTransaction on payment success
-    if status in ("paid", "authorized") and prev_status not in ("paid", "authorized"):
+    # Start the charger only once, when the £5 hold is in place.
+    if status == "authorized" and prev_status not in ("authorized", "paid"):
         await _trigger_remote_start(session_id, row["cp_id"], row["connector_id"])
+
+    return {"ok": True}
 
     return {"ok": True}
 
