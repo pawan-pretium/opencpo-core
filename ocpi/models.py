@@ -208,7 +208,7 @@ class Session(BaseModel):
     location_id: str
     evse_uid: str
     connector_id: str
-    currency: str = "EUR"
+    currency: str = "GBP"
     total_cost: Optional[float] = None
     status: SessionStatus
     last_updated: datetime
@@ -231,7 +231,7 @@ class Tariff(BaseModel):
     country_code: str = os.getenv("OCPI_COUNTRY_CODE", "XX")
     party_id: str = os.getenv("OCPI_PARTY_ID", "CPO")
     id: str
-    currency: str = "EUR"
+    currency: str = "GBP"
     type: Optional[TariffType] = None
     elements: list[TariffElement]
     last_updated: datetime
@@ -263,7 +263,7 @@ class CDR(BaseModel):
     cdr_token: CdrToken
     auth_method: AuthMethod
     location: Location
-    currency: str = "EUR"
+    currency: str = "GBP"
     total_cost: float
     total_energy: float
     total_time: float           # hours

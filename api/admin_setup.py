@@ -124,7 +124,7 @@ class StepTailscaleRequest(BaseModel):
 class StepOrgRequest(BaseModel):
     name: str = "My CPO"
     timezone: str = "Europe/Amsterdam"
-    currency: str = "EUR"
+    currency: str = "GBP"
     public_url: str = "http://localhost"
 
 
@@ -150,7 +150,7 @@ class StepPkiRequest(BaseModel):
 
 
 class StepPricingRequest(BaseModel):
-    currency: str = "EUR"
+    currency: str = "GBP"
     default_rate_kwh: float = 0.35
     tariff_name: str = "Standard Rate"
 

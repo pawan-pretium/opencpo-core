@@ -208,7 +208,7 @@ async def _notify_session_complete(
 
         public_id = row["public_id"]
         rate_kwh = float(row["rate_kwh"] or 0)
-        cost = energy_kwh * rate_kwh * 1.21  # incl BTW
+        cost = energy_kwh * rate_kwh * 1.20  # incl VAT (UK 20%)
 
         # Push notification
         title = "⚡ Laden voltooid"
@@ -299,7 +299,7 @@ def _calculate_cdr_cost(energy_kwh: float, tariff_rate: Decimal = Decimal("0.35"
     """Calculate CDR cost using Decimal arithmetic. Returns cost JSONB dict."""
     energy = Decimal(str(energy_kwh))
     energy_cost = (energy * tariff_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    vat_rate = Decimal("0.21")
+    vat_rate = Decimal("0.20")
     vat_amount = (energy_cost * vat_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     total = energy_cost + vat_amount
     return {
@@ -309,10 +309,10 @@ def _calculate_cdr_cost(energy_kwh: float, tariff_rate: Decimal = Decimal("0.35"
         "time_cost": 0.0,
         "flat_fee": 0.0,
         "subtotal": float(energy_cost),
-        "vat_rate": 21.0,
+        "vat_rate": 20.0,
         "vat_amount": float(vat_amount),
         "total": float(total),
-        "currency": "EUR",
+        "currency": "GBP",
     }
 
 

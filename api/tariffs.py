@@ -16,11 +16,11 @@ router = APIRouter()
 class TariffCreate(BaseModel):
     id: str
     name: str
-    currency: str = "EUR"
-    energy_rate: float = 0       # €/kWh
-    time_rate: float = 0         # €/min while charging
-    idle_rate: float = 0         # €/min after charging
-    flat_fee: float = 0          # € per session
+    currency: str = "GBP"
+    energy_rate: float = 0       # £/kWh
+    time_rate: float = 0         # £/min while charging
+    idle_rate: float = 0         # £/min after charging
+    flat_fee: float = 0          # £ per session
 
 
 class TariffUpdate(BaseModel):
@@ -51,7 +51,7 @@ async def create_tariff(tariff: TariffCreate):
         """, tariff.id, tariff.name, tariff.currency,
             tariff.energy_rate, tariff.time_rate, tariff.idle_rate, tariff.flat_fee)
 
-    logger.info(f"Tariff created: {tariff.id} energy={tariff.energy_rate}€/kWh")
+    logger.info(f"Tariff created: {tariff.id} energy={tariff.energy_rate} {tariff.currency}/kWh")
     return {"status": "created", "id": tariff.id}
 
 

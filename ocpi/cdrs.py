@@ -50,7 +50,7 @@ async def get_cdrs(
                 "contract_id": cdr["auth_id"] or "",
             },
             "auth_method": "WHITELIST" if cdr["auth_method"] == "rfid" else "AUTH_REQUEST",
-            "currency": "EUR",
+            "currency": "GBP",
             "total_cost": cost.get("total", 0),
             "total_energy": float(cdr["energy_kwh"]),
             "total_time": round(float(cdr["duration_min"]) / 60, 2),

@@ -106,7 +106,7 @@ async def get_tax_rate() -> float:
         row = await conn.fetchrow(
             "SELECT value FROM ocpp.pricing_config WHERE key IN ('tax_rate', 'btw_rate') ORDER BY key LIMIT 1"
         )
-    return float(row["value"]) if row else 0.21
+    return float(row["value"]) if row else 0.20  # UK standard VAT
 
 
 async def get_tier_rate(tier_id: str) -> dict:

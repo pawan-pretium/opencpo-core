@@ -54,7 +54,7 @@ async def get_sessions(
             "location_id": s["charge_point"],
             "evse_uid": s["charge_point"],
             "connector_id": str(s["connector_id"]),
-            "currency": "EUR",
+            "currency": "GBP",
             "status": ocpi_status,
             "last_updated": (s["stop_time"] or s["start_time"]).isoformat(),
         })
