@@ -108,6 +108,8 @@ async def on_connect_201(cp_id: str, websocket, client_cert=None) -> None:
         response = await handler.handle_message(raw_message)
         if response:
             await websocket.send(response)
+        while handler._outbound:
+            await websocket.send(handler._outbound.pop(0))
 
 
 async def on_disconnect_201(cp_id: str) -> None:
@@ -142,6 +144,12 @@ async def startup():
     # PKI — initialize CA (load or generate)
     await ca.initialize()
     logger.info("PKI initialized")
+
+    try:
+        from api.push import ensure_vapid_keys
+        ensure_vapid_keys()
+    except Exception as exc:
+        logger.warning("VAPID keys were not created: %s", exc)
 
     # Seed Redis with connector states from DB (survives restarts)
     async with db.read() as conn:
@@ -188,10 +196,15 @@ async def main():
     ocpp201_server = OCPP201Server(on_connect_201, on_disconnect_201)
 
     # Register charger registry backends
-    from state.charger_registry import set_ocpp16_server, set_redis_state, set_handlers_16
+    from state.charger_registry import (
+        set_handlers_16, set_handlers_201, set_ocpp16_server,
+        set_ocpp201_server, set_redis_state,
+    )
     set_ocpp16_server(ocpp16_server)
+    set_ocpp201_server(ocpp201_server)
     set_redis_state(redis_state)
     set_handlers_16(_handlers_16)
+    set_handlers_201(_handlers_201)
 
     # Create tasks for all services
     tasks = [
@@ -199,10 +212,11 @@ async def main():
         asyncio.create_task(ocpp201_server.serve(), name="ocpp-2.0.1"),
     ]
 
-    # Event consumers (optional — only start if configured)
-    if os.getenv("LAGO_API_KEY"):
-        from events.consumers import lago_billing
-        tasks.append(asyncio.create_task(lago_billing.run(event_bus), name="lago-billing"))
+    # Lago billing consumer is always running. Without LAGO_API_KEY it logs a
+    # warning and leaves each CDR unacknowledged, so nothing is lost when the
+    # key is added later.
+    from events.consumers import lago_billing
+    tasks.append(asyncio.create_task(lago_billing.run(event_bus), name="lago-billing"))
 
     # REST API (uvicorn) — pass the app object directly, not the import string.
     # Using "api.main:app" string caused silent binding failures because uvicorn

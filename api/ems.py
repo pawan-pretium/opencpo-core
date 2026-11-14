@@ -33,6 +33,113 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/ems", tags=["EMS"])
 
+_schema_ready = False
+
+
+async def ensure_ems_schema() -> None:
+    """Create the energy tables the EMS routes already query."""
+    global _schema_ready
+    if _schema_ready:
+        return
+    async with db.write() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ocpp.ems_sites (
+                id text PRIMARY KEY,
+                name text NOT NULL,
+                address text,
+                grid_connection_kw double precision NOT NULL DEFAULT 80,
+                grid_phases integer NOT NULL DEFAULT 3,
+                config jsonb NOT NULL DEFAULT '{}'::jsonb,
+                strategy text NOT NULL DEFAULT 'monitor_only',
+                strategy_params jsonb NOT NULL DEFAULT '{}'::jsonb,
+                status text NOT NULL DEFAULT 'active',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ocpp.ems_telemetry (
+                time timestamptz NOT NULL,
+                site_id text NOT NULL,
+                grid_kw double precision,
+                solar_kw double precision,
+                battery_kw double precision,
+                battery_soc double precision,
+                battery_state text,
+                battery_temp_c double precision,
+                battery_voltage_v double precision,
+                charger_kw double precision,
+                building_kw double precision,
+                inverter_kw double precision,
+                frequency_hz double precision,
+                grid_v_l1 double precision,
+                grid_v_l2 double precision,
+                grid_v_l3 double precision,
+                grid_i_l1 double precision,
+                grid_i_l2 double precision,
+                grid_i_l3 double precision,
+                strategy text,
+                command_kw double precision,
+                command_reason text,
+                override_kw double precision,
+                ems_mode text
+            )
+        """)
+        try:
+            await conn.execute(
+                "SELECT create_hypertable('ocpp.ems_telemetry', 'time', if_not_exists => TRUE)"
+            )
+        except Exception as exc:
+            logger.info("ems telemetry left as a plain table: %s", exc)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS ems_telemetry_site_time ON ocpp.ems_telemetry (site_id, time DESC)"
+        )
+        await conn.execute("""
+            CREATE OR REPLACE VIEW ocpp.ems_hourly AS
+            SELECT
+                date_trunc('hour', time) AS hour,
+                site_id,
+                SUM(GREATEST(solar_kw, 0) * 10.0 / 3600) AS solar_kwh,
+                SUM(GREATEST(grid_kw, 0) * 10.0 / 3600) AS grid_import_kwh,
+                SUM(GREATEST(-grid_kw, 0) * 10.0 / 3600) AS grid_export_kwh,
+                SUM(GREATEST(charger_kw, 0) * 10.0 / 3600) AS charger_kwh,
+                SUM(GREATEST(building_kw, 0) * 10.0 / 3600) AS building_kwh,
+                SUM(GREATEST(battery_kw, 0) * 10.0 / 3600) AS battery_charge_kwh,
+                SUM(GREATEST(-battery_kw, 0) * 10.0 / 3600) AS battery_discharge_kwh,
+                AVG(grid_kw) AS avg_grid_kw,
+                MAX(grid_kw) AS max_grid_kw,
+                AVG(solar_kw) AS avg_solar_kw,
+                MAX(solar_kw) AS max_solar_kw,
+                AVG(battery_soc) AS avg_battery_soc,
+                COUNT(*) AS sample_count
+            FROM ocpp.ems_telemetry
+            GROUP BY 1, 2
+        """)
+        await conn.execute("""
+            CREATE OR REPLACE VIEW ocpp.ems_daily AS
+            SELECT
+                date_trunc('day', time) AS day,
+                site_id,
+                SUM(GREATEST(solar_kw, 0) * 10.0 / 3600) AS solar_kwh,
+                SUM(GREATEST(grid_kw, 0) * 10.0 / 3600) AS grid_import_kwh,
+                SUM(GREATEST(-grid_kw, 0) * 10.0 / 3600) AS grid_export_kwh,
+                SUM(GREATEST(charger_kw, 0) * 10.0 / 3600) AS charger_kwh,
+                SUM(GREATEST(building_kw, 0) * 10.0 / 3600) AS building_kwh,
+                SUM(GREATEST(battery_kw, 0) * 10.0 / 3600) AS battery_charge_kwh,
+                SUM(GREATEST(-battery_kw, 0) * 10.0 / 3600) AS battery_discharge_kwh,
+                AVG(grid_kw) AS avg_grid_kw,
+                MAX(grid_kw) AS peak_grid_kw,
+                AVG(solar_kw) AS avg_solar_kw,
+                MAX(solar_kw) AS peak_solar_kw,
+                MIN(battery_soc) AS min_battery_soc,
+                MAX(battery_soc) AS max_battery_soc,
+                COUNT(*) AS sample_count
+            FROM ocpp.ems_telemetry
+            GROUP BY 1, 2
+        """)
+    _schema_ready = True
+    logger.info("EMS tables ready")
+
 
 # ── Models ────────────────────────────────────────────────────────────────
 
@@ -103,6 +210,7 @@ async def ems_telemetry_ingest(req: TelemetryRequest):
     Non-fatal: DB failures are logged and returned in the response body
     so the controller can detect them without crashing the ingest loop.
     """
+    await ensure_ems_schema()
     now = datetime.now(timezone.utc)
     db_ok = False
     bus_ok = False
@@ -174,6 +282,7 @@ async def ems_telemetry_ingest(req: TelemetryRequest):
 @router.get("/sites")
 async def ems_sites_list():
     """List all configured EMS sites."""
+    await ensure_ems_schema()
     try:
         async with db.read() as conn:
             rows = await conn.fetch("""
@@ -191,6 +300,7 @@ async def ems_sites_list():
 @router.get("/sites/{site_id}")
 async def ems_site_get(site_id: str):
     """Get site config including JSONB strategy config."""
+    await ensure_ems_schema()
     try:
         async with db.read() as conn:
             row = await conn.fetchrow("""
@@ -213,6 +323,7 @@ async def ems_site_get(site_id: str):
 async def ems_site_upsert(req: SiteCreateRequest):
     """Create or update a site configuration."""
     import json
+    await ensure_ems_schema()
     try:
         async with db.write() as conn:
             await conn.execute("""
@@ -252,6 +363,7 @@ async def ems_live(site_id: str = Query("default")):
     For sub-second freshness, consumers should subscribe to the Redis
     event stream (EventType.EMS_SITE_UPDATE).
     """
+    await ensure_ems_schema()
     try:
         async with db.read() as conn:
             row = await conn.fetchrow("""
@@ -283,6 +395,7 @@ async def ems_daily(site_id: str = Query("default")):
     Assumes 10-second sample intervals (each row = 10/3600 kWh per kW).
     Positive-only sums: negative grid_kw = export, negative battery_kw = discharge.
     """
+    await ensure_ems_schema()
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -337,6 +450,7 @@ async def ems_history_hourly(
     Hourly kWh aggregates from the ocpp.ems_hourly continuous aggregate.
     Returns rows sorted ascending (oldest first) for time-series charts.
     """
+    await ensure_ems_schema()
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
     try:
@@ -387,6 +501,7 @@ async def ems_history_daily(
     Daily kWh aggregates from the ocpp.ems_daily continuous aggregate.
     Returns rows sorted ascending (oldest first) for reports and bar charts.
     """
+    await ensure_ems_schema()
     since = datetime.now(timezone.utc) - timedelta(days=months * 31)
 
     try:

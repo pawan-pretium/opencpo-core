@@ -5,6 +5,12 @@ Listens for SESSION_CDR events on the event bus and forwards the kWh
 delivered to Lago as billable events. Lago handles invoice generation,
 tax calculation, and payment collection.
 
+Durability: the event bus acknowledges a message once the consumer loop
+moves on, so a failed Lago send must not rely on the bus for retry. Every
+billable event is written to ocpp.lago_outbox first, removed only after
+Lago accepts it, and resent by a retry loop. Lago deduplicates on
+transaction_id, so a resend is safe.
+
 Consumer group: "lago-billing"
 """
 import asyncio
@@ -20,24 +26,42 @@ from events.types import EventType
 logger = logging.getLogger(__name__)
 
 # Configuration
-LAGO_API_URL = os.getenv("LAGO_API_URL", "http://127.0.0.1:3100")
+LAGO_API_URL = os.getenv("LAGO_API_URL", "https://api.getlago.com")
 LAGO_API_KEY = os.getenv("LAGO_API_KEY", "")
 CONSUMER_GROUP = "lago-billing"
 CONSUMER_NAME = "lago-billing-worker-1"
+RETRY_INTERVAL_S = 60
+RETRY_BATCH = 100
+
+_OUTBOX_DDL = """
+CREATE TABLE IF NOT EXISTS ocpp.lago_outbox (
+    transaction_id          TEXT        PRIMARY KEY,
+    subscription_id         TEXT        NOT NULL,
+    kwh                     REAL        NOT NULL,
+    event_ts                TEXT,
+    charge_point            TEXT,
+    attempts                INTEGER     NOT NULL DEFAULT 0,
+    last_error              TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+
+async def _ensure_outbox() -> None:
+    """Create the outbox table on first run. Safe to repeat."""
+    from state.postgres import db
+
+    async with db.write() as conn:
+        await conn.execute(_OUTBOX_DDL)
 
 
 async def _resolve_subscription(charge_point: str) -> str | None:
     """
     Resolve a charge point to its Lago external_subscription_id.
 
-    Lookup chain:
-    1. Check Redis for charger → group mapping
-    2. Use group external_id as the subscription prefix
-
-    Returns external_subscription_id or None if not billable.
+    Returns external_subscription_id or None if not billable (no group
+    with a billing method).
     """
-    # For now, use a simple mapping via DB
-    # TODO: cache in Redis for performance
     from state.postgres import db
 
     async with db.read() as c:
@@ -48,8 +72,8 @@ async def _resolve_subscription(charge_point: str) -> str | None:
             WHERE cp.id = $1 AND g.billing_method IS NOT NULL
         """, charge_point)
 
-        if row and row["external_id"]:
-            return f"{row['external_id']}_{os.getenv('LAGO_SUBSCRIPTION_SUFFIX', 'fleet_001')}"
+    if row and row["external_id"]:
+        return f"{row['external_id']}_{os.getenv('LAGO_SUBSCRIPTION_SUFFIX', 'fleet_001')}"
 
     return None
 
@@ -60,11 +84,10 @@ async def _send_to_lago(
     kwh: float,
     timestamp: str,
     charge_point: str,
-) -> bool:
-    """Send a billable event to Lago. Returns True on success."""
+) -> tuple[bool, str]:
+    """Send one billable event to Lago. Returns (accepted, error_text)."""
     if not LAGO_API_KEY:
-        logger.error("LAGO_API_KEY not configured — skipping billing event")
-        return False
+        return False, "LAGO_API_KEY not configured"
 
     payload = {
         "event": {
@@ -98,26 +121,89 @@ async def _send_to_lago(
                 f"{kwh:.3f} kWh | sub={subscription_id} | "
                 f"lago_id={lago_event.get('lago_id', '?')}"
             )
-            return True
-        else:
-            logger.error(
-                f"Lago API error {resp.status_code}: {resp.text} | "
-                f"transaction_id={transaction_id}"
-            )
-            return False
+            return True, ""
+        return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
 
     except httpx.TimeoutException:
-        logger.error(f"Lago API timeout for {transaction_id}")
-        return False
+        return False, "timeout"
     except Exception as e:
-        logger.error(f"Lago API error for {transaction_id}: {e}")
-        return False
+        return False, str(e)[:300]
+
+
+async def _record(
+    transaction_id: str,
+    subscription_id: str,
+    kwh: float,
+    timestamp: str,
+    charge_point: str,
+) -> None:
+    """Store a billable event in the outbox until Lago accepts it."""
+    from state.postgres import db
+
+    async with db.write() as conn:
+        await conn.execute("""
+            INSERT INTO ocpp.lago_outbox
+                (transaction_id, subscription_id, kwh, event_ts, charge_point)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (transaction_id) DO NOTHING
+        """, transaction_id, subscription_id, kwh, timestamp, charge_point)
+
+
+async def _deliver(row) -> bool:
+    """Try to send one outbox row. Remove it on success, else note the error."""
+    from state.postgres import db
+
+    accepted, error = await _send_to_lago(
+        transaction_id=row["transaction_id"],
+        subscription_id=row["subscription_id"],
+        kwh=row["kwh"],
+        timestamp=row["event_ts"] or "",
+        charge_point=row["charge_point"] or "",
+    )
+    async with db.write() as conn:
+        if accepted:
+            await conn.execute(
+                "DELETE FROM ocpp.lago_outbox WHERE transaction_id = $1",
+                row["transaction_id"],
+            )
+        else:
+            await conn.execute("""
+                UPDATE ocpp.lago_outbox
+                   SET attempts = attempts + 1, last_error = $2
+                 WHERE transaction_id = $1
+            """, row["transaction_id"], error)
+            logger.warning(
+                "Lago delivery pending for %s: %s", row["transaction_id"], error
+            )
+    return accepted
+
+
+async def _retry_loop() -> None:
+    """Resend every pending outbox row on a fixed interval."""
+    from state.postgres import db
+
+    while True:
+        try:
+            async with db.read() as conn:
+                rows = await conn.fetch("""
+                    SELECT transaction_id, subscription_id, kwh, event_ts, charge_point
+                      FROM ocpp.lago_outbox
+                  ORDER BY created_at
+                     LIMIT $1
+                """, RETRY_BATCH)
+            for row in rows:
+                await _deliver(row)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Lago retry loop error: %s", exc)
+        await asyncio.sleep(RETRY_INTERVAL_S)
 
 
 async def run(event_bus: EventBus) -> None:
     """
-    Main consumer loop. Listens for SESSION_CDR events and sends
-    billing events to Lago.
+    Main consumer loop. Listens for SESSION_CDR events, stores each billable
+    one in the outbox, and delivers it to Lago.
     """
     logger.info(
         f"Lago billing consumer starting | "
@@ -126,9 +212,12 @@ async def run(event_bus: EventBus) -> None:
 
     if not LAGO_API_KEY:
         logger.warning(
-            "LAGO_API_KEY not set — billing consumer will log events "
-            "but NOT send to Lago. Set LAGO_API_KEY env var to enable."
+            "LAGO_API_KEY not set — billable sessions are held in ocpp.lago_outbox "
+            "until the key is added."
         )
+
+    await _ensure_outbox()
+    asyncio.create_task(_retry_loop(), name="lago-retry")
 
     async for event in event_bus.consume(
         group=CONSUMER_GROUP,
@@ -147,7 +236,6 @@ async def run(event_bus: EventBus) -> None:
             logger.debug(f"Skipping zero-energy CDR: {session_id}")
             continue
 
-        # Resolve charge point → subscription
         subscription_id = await _resolve_subscription(charge_point)
         if not subscription_id:
             logger.info(
@@ -157,18 +245,17 @@ async def run(event_bus: EventBus) -> None:
             continue
 
         # Transaction ID = session_id (idempotent — Lago deduplicates)
-        success = await _send_to_lago(
+        await _record(
             transaction_id=session_id,
             subscription_id=subscription_id,
             kwh=kwh,
             timestamp=event.timestamp,
             charge_point=charge_point,
         )
-
-        if not success:
-            logger.warning(
-                f"Failed to bill session {session_id} — "
-                f"will be retried via Redis XPENDING"
-            )
-            # Don't ack — the event bus consumer loop handles this
-            # by not acking failed events (they stay in pending)
+        await _deliver({
+            "transaction_id": session_id,
+            "subscription_id": subscription_id,
+            "kwh": kwh,
+            "event_ts": event.timestamp,
+            "charge_point": charge_point,
+        })

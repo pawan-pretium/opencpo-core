@@ -178,6 +178,11 @@ async def handle_stop_transaction(
 
         logger.info(f"[{cp_id}] Session stopped: txn={transaction_id} reason={reason} energy={session['energy_kwh']:.1f}kWh")
 
+        # Charge the saved card for the energy. Runs after the charger is answered.
+        import asyncio
+        from api.stripe_billing import settle_session
+        asyncio.get_running_loop().create_task(settle_session(transaction_id))
+
         # Send push notification if driver subscribed
         await _notify_session_complete(session_id, float(session["energy_kwh"]), transaction_id)
     else:
@@ -227,6 +232,12 @@ async def _notify_session_complete(
                     )
             except Exception as e:
                 logger.warning("Push service call failed: %s", e)
+
+        try:
+            from api.push import send_push_for_session
+            await send_push_for_session(public_id, title, body, url)
+        except Exception as e:
+            logger.warning("In-process push failed: %s", e)
 
         # Receipt email — resolve email from session or driver account
         email = row["driver_email"]

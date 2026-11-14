@@ -6,7 +6,7 @@ import os
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, HTTPException, Request, Depends
 
 from ocpi.main import ocpi_response, ocpi_error, verify_ocpi_token
 from state.postgres import db
@@ -61,7 +61,25 @@ async def post_credentials(request: Request):
     """
     Partner sends their credentials — we register them and return ours.
     This is the OCPI handshake.
+
+    OCPI 2.2.1 requires the partner to present the initial token we issued
+    out-of-band (see api/ocpi_management.py create_partner, which stores it
+    as token_a with status 'pending'). Without that token anyone could
+    register as an active partner and read sessions and CDRs.
     """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Token "):
+        raise HTTPException(401, "Missing or invalid Authorization header")
+    initial_token = auth[6:].strip()
+
+    async with db.read() as conn:
+        pending = await conn.fetchrow(
+            "SELECT id FROM ocpp.ocpi_partners WHERE token_a = $1 AND status = 'pending'",
+            initial_token,
+        )
+    if not pending:
+        raise HTTPException(401, "Invalid OCPI token")
+
     body = await request.json()
 
     partner_token = body.get("token", "")
@@ -80,13 +98,15 @@ async def post_credentials(request: Request):
     # Generate our token for them
     our_token = secrets.token_urlsafe(32)
 
+    # Activate the partner row the operator created. The initial token is
+    # spent here: token_a now holds our new token for this partner.
     async with db.write() as conn:
         await conn.execute("""
-            INSERT INTO ocpp.ocpi_partners (party_id, country_code, role, name, url, token_a, token_b, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-            ON CONFLICT (party_id, country_code, role) DO UPDATE SET
-                name = $4, url = $5, token_a = $6, token_b = $7, status = 'active'
-        """, party_id, country_code, partner_role, name, partner_url,
+            UPDATE ocpp.ocpi_partners SET
+                party_id = $2, country_code = $3, role = $4, name = $5, url = $6,
+                token_a = $7, token_b = $8, status = 'active', last_sync = NOW()
+            WHERE id = $1
+        """, pending["id"], party_id, country_code, partner_role, name, partner_url,
             our_token, partner_token)
 
     logger.info(f"OCPI credentials exchanged: {country_code}*{party_id} ({name}) role={partner_role}")

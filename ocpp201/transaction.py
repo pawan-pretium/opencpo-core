@@ -179,6 +179,11 @@ class TransactionMixin:
                 ))
 
                 logger.info(f"[{self.cp_id}] Session ended: txn={txn_id} reason={stopped_reason} energy={session['energy_kwh']:.1f}kWh")
+                if str(txn_id).isdigit():
+                    from ocpp16.session import _notify_session_complete
+                    await _notify_session_complete(
+                        session_id, float(session["energy_kwh"]), int(txn_id)
+                    )
         else:
             logger.warning(f"[{self.cp_id}] TransactionEvent Ended for unknown txn={txn_id}")
 

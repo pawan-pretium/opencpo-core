@@ -45,6 +45,7 @@ class ChargePointHandler201(TransactionMixin, MeterMixin, SecurityMixin):
         self.event_bus = event_bus
         self.client_cert = client_cert  # TLS client cert (security profile 3)
         self._pending_calls: dict[str, tuple[str, float]] = {}
+        self._outbound: list[str] = []
         self._simulated = False
         # Track active transactions by evse_id
         self._active_transactions: dict[str, str] = {}  # transaction_id → session_id
@@ -205,7 +206,7 @@ class ChargePointHandler201(TransactionMixin, MeterMixin, SecurityMixin):
         token_type = id_token.get("type", "ISO14443")  # ISO14443=RFID, eMAID=P&C
 
         # Certificate-based auth (Plug & Charge)
-        cert_chain = payload.get("15118CertificateHashData")
+        cert_chain = payload.get("iso15118CertificateHashData") or payload.get("15118CertificateHashData")
 
         if token_type == "eMAID" and cert_chain:
             # P&C: validate contract cert against our PKI

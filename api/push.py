@@ -23,12 +23,44 @@ VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "")
 VAPID_EMAIL = os.getenv("VAPID_EMAIL", "")
 
-if not VAPID_PRIVATE_KEY:
-    logger.warning(
-        "VAPID_PRIVATE_KEY not set — push notifications disabled. "
-        "Generate keys with: python -c \"from py_vapid import Vapid; v=Vapid(); v.generate_keys(); "
-        "print('Private:', v.private_pem().decode()); print('Public:', v.public_key)\""
-    )
+def ensure_vapid_keys() -> None:
+    """Create a VAPID key pair on the PKI volume when none is configured.
+
+    The private key stays on disk. It is not written to the log.
+    """
+    global VAPID_PRIVATE_KEY, VAPID_PUBLIC_KEY, VAPID_EMAIL
+    if VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY:
+        return
+    from pathlib import Path
+    from config import config
+
+    directory = Path(config.pki.data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    private_path = directory / "vapid.key"
+    public_path = directory / "vapid.pub"
+    if private_path.exists() and public_path.exists():
+        VAPID_PRIVATE_KEY = private_path.read_text().strip()
+        VAPID_PUBLIC_KEY = public_path.read_text().strip()
+    else:
+        import base64
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        from py_vapid import Vapid
+
+        vapid = Vapid()
+        vapid.generate_keys()
+        private_pem = vapid.private_pem().decode()
+        raw_public = vapid.public_key.public_bytes(
+            Encoding.X962, PublicFormat.UncompressedPoint
+        )
+        public_key = base64.urlsafe_b64encode(raw_public).decode().rstrip("=")
+        private_path.write_text(private_pem)
+        private_path.chmod(0o600)
+        public_path.write_text(public_key)
+        VAPID_PRIVATE_KEY = private_pem
+        VAPID_PUBLIC_KEY = public_key
+        logger.info("VAPID key pair created for driver push")
+    if not VAPID_EMAIL:
+        VAPID_EMAIL = "mailto:admin@pretiumsynergy.co.uk"
 
 
 # ── DB init ───────────────────────────────────────────────────────────────
@@ -66,6 +98,7 @@ class PushUnsubscribeRequest(BaseModel):
 @router.get("/key")
 async def get_vapid_key():
     """Return VAPID public key for client-side push subscription."""
+    ensure_vapid_keys()
     return {"publicKey": VAPID_PUBLIC_KEY}
 
 
@@ -108,8 +141,9 @@ async def unsubscribe(body: PushUnsubscribeRequest):
 
 def send_push(subscription_info: dict, title: str, body: str, url: Optional[str] = None) -> None:
     """Send a Web Push notification. Runs synchronously — call from asyncio via run_in_executor."""
+    ensure_vapid_keys()
     if not VAPID_PRIVATE_KEY:
-        logger.debug("Push skipped — VAPID_PRIVATE_KEY not configured")
+        logger.debug("Push skipped — VAPID key is not available")
         return
     try:
         from pywebpush import webpush, WebPushException

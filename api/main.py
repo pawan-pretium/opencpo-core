@@ -102,6 +102,8 @@ from api.admin_auth import router as admin_auth_router
 from api.admin_setup import router as admin_setup_router
 from api.admin_update import router as admin_update_router
 from api.admin_backup import router as admin_backup_router
+from api.ems import router as ems_router
+from api.push import router as push_router
 
 _mgmt = [Depends(management_auth)]  # shorthand for management-only routes
 
@@ -141,6 +143,13 @@ app.include_router(settings_router, dependencies=_mgmt)
 app.include_router(ocpi_mgmt_router, prefix="/api/v1/ocpi", tags=["OCPI Management"], dependencies=_mgmt)
 app.include_router(network_router, dependencies=_mgmt)
 app.include_router(pricing_router)
+app.include_router(ems_router, dependencies=_mgmt)
+app.include_router(push_router)
 
 # Cert setup — driver certificate install wizard (public for driver-facing flows)
 app.include_router(cert_setup_router)
+
+# OCPI 2.2.1 CPO interface — partner-token protected (ocpi/main.py verify_ocpi_token).
+# Mounted last so every management and public route above keeps priority.
+from ocpi.main import ocpi_app  # noqa: E402
+app.mount("/", ocpi_app)

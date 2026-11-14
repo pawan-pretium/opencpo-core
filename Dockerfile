@@ -11,6 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
+# ISO 15118 EXI codec (libcbv2g). Built here so the runtime image can
+# read and write Plug and Charge certificate messages.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build git \
+    && git clone --depth 1 --recurse-submodules --branch v1.0 \
+        https://github.com/IdahoLabResearch/EXPy.git /tmp/EXPy \
+    && pip install --no-cache-dir --prefix=/install /tmp/EXPy \
+    && rm -rf /tmp/EXPy /var/lib/apt/lists/*
+
 
 FROM python:3.12-slim
 
