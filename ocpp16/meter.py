@@ -203,6 +203,7 @@ async def handle_meter_values(
                     "UPDATE ocpp.public_sessions SET kwh_delivered = $1 WHERE ocpp_transaction_id = $2",
                     session_energy_kwh, transaction_id,
                 )
+            await _stop_at_session_cap(cp_id, transaction_id, session_energy_kwh)
 
         # Publish event (consumers get both raw register and session energy)
         event_data = {
@@ -220,3 +221,28 @@ async def handle_meter_values(
         ))
 
     return {}
+
+
+_cap_stop_sent: set[int] = set()
+
+
+async def _stop_at_session_cap(cp_id: str, transaction_id: int, energy_kwh: float) -> None:
+    """Stop the charger once the energy reaches £100. The session is then charged."""
+    if transaction_id in _cap_stop_sent:
+        return
+    async with db.read() as conn:
+        row = await conn.fetchrow(
+            "SELECT rate_kwh FROM ocpp.public_sessions WHERE ocpp_transaction_id = $1",
+            transaction_id,
+        )
+    if not row or row["rate_kwh"] is None:
+        return
+    from api.stripe_billing import session_amount_pence, SESSION_CAP_PENCE
+    if session_amount_pence(energy_kwh, row["rate_kwh"]) < SESSION_CAP_PENCE:
+        return
+    _cap_stop_sent.add(transaction_id)
+    from state import charger_registry
+    sent = await charger_registry.send_command(
+        cp_id, "RemoteStopTransaction", {"transactionId": int(transaction_id)}
+    )
+    logger.info("Session cap £100 reached for txn=%s stop_sent=%s", transaction_id, bool(sent))

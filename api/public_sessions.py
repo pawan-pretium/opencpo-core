@@ -45,6 +45,41 @@ class SessionCreate(BaseModel):
     pricing_tier: Optional[str] = None  # Override tier; if None, resolved from driver account
 
 
+async def _refuse_if_unpaid(phone: str | None, email: str | None) -> None:
+    """Refuse a new session while an earlier one is still unpaid.
+
+    If the driver has since paid the link, clear the balance and let them start.
+    """
+    if not phone and not email:
+        return
+    async with db.read() as conn:
+        row = await conn.fetchrow("""
+            SELECT id::text AS id, payment_url, debt_checkout_id
+              FROM ocpp.public_sessions
+             WHERE payment_status = 'unpaid'
+               AND (($1::text IS NOT NULL AND driver_phone = $1)
+                    OR ($2::text IS NOT NULL AND driver_email = $2))
+             ORDER BY created_at DESC
+             LIMIT 1
+        """, phone, email)
+    if not row:
+        return
+    from api.stripe_billing import debt_is_paid
+    if await debt_is_paid(row["debt_checkout_id"]):
+        async with db.write() as conn:
+            await conn.execute(
+                "UPDATE ocpp.public_sessions SET payment_status = 'paid' WHERE id = $1::uuid",
+                row["id"],
+            )
+        return
+    link = row["payment_url"] or ""
+    raise HTTPException(
+        402,
+        "You have an unpaid charging session. Pay it before starting another."
+        + (f" {link}" if link else ""),
+    )
+
+
 async def _get_charger_live(cp_id: str) -> dict | None:
     try:
         return await redis_state.get_charger(cp_id)
@@ -63,6 +98,9 @@ async def create_session(req: SessionCreate):
     Note: Payment integration is handled by the operator's payment plugin.
     The session starts in 'pending' status; payment plugin updates to 'paid'.
     """
+    # A driver with an unpaid session cannot start another one.
+    await _refuse_if_unpaid(req.driver_phone, req.driver_email)
+
     # Check connector availability from Redis before creating session
     live = await _get_charger_live(req.cp_id)
     if live:
@@ -147,6 +185,18 @@ async def create_session(req: SessionCreate):
              req.driver_phone, req.driver_email, rate_kwh,
              pricing_tier, spot_price_at_start, cost_basis_at_start, rate_kwh)
 
+    from api.stripe_billing import StripeCallError, create_card_check
+    try:
+        checkout_url = await create_card_check(session_id, req.cp_id, req.connector_id)
+    except StripeCallError as exc:
+        logger.warning("Card check page failed for session %s: %s", session_id[:8], exc)
+        async with db.write() as conn:
+            await conn.execute(
+                "UPDATE ocpp.public_sessions SET payment_status = 'cancelled' WHERE id = $1::uuid",
+                session_id,
+            )
+        raise HTTPException(502, "The payment page could not be opened. Nothing has been charged.")
+
     logger.info(
         "Session %s created for %s connector %d | tier=%s rate=%.4f",
         session_id[:8], req.cp_id, req.connector_id, pricing_tier, rate_kwh,
@@ -167,6 +217,7 @@ async def create_session(req: SessionCreate):
         "cp_id":         req.cp_id,
         "connector_id":  req.connector_id,
         "payment_status": "pending",
+        "checkout_url":  checkout_url,
         "rate_kwh":      rate_kwh,
         "pricing_tier":  pricing_tier,
         "created_at":    datetime.now(timezone.utc).isoformat(),
@@ -206,7 +257,7 @@ async def get_session(session_id: str):
     async with db.read() as conn:
         row = await conn.fetchrow("""
             SELECT id::text AS id, cp_id, connector_id, driver_phone, driver_email,
-                   rate_kwh, payment_status,
+                   rate_kwh, payment_status, payment_url, amount_due_pence,
                    ocpp_transaction_id, kwh_delivered,
                    started_at, stopped_at, created_at
               FROM ocpp.public_sessions
@@ -260,7 +311,7 @@ async def stop_session(session_id: str):
     txn_id = row["ocpp_transaction_id"]
 
     # Paid but charger hasn't started yet -- don't 400, tell client to retry
-    if not txn_id and row.get("payment_status") == "paid":
+    if not txn_id and row.get("payment_status") in ("paid", "authorized"):
         return {
             "starting": True,
             "message": "Charger is still starting, please retry in 10 seconds",

@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import asyncio
 from datetime import datetime, timezone
 import time
 
@@ -163,20 +164,41 @@ async def payment_webhook(request: Request):
         raise HTTPException(status_code=400, detail="invalid event")
 
     status = _STRIPE_STATUS.get(event.get("type", ""))
-    if status is None:
+    obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        return {"ok": True}
+    metadata = obj.get("metadata") or {}
+    kind = metadata.get("kind", "hold")
+    session_id = metadata.get("opencpo_session_id", "")
+    payment_intent_id = obj.get("id", "")
+
+    # A final charge and a payment-link charge are settled by the API call
+    # that created them, or by the next visit. Do not let those events
+    # restart a charger or cancel a session that already ran.
+    if kind in ("final", "debt"):
+        if event.get("type") == "payment_intent.succeeded" and session_id:
+            async with db.write() as conn:
+                await conn.execute("""
+                    UPDATE ocpp.public_sessions
+                       SET payment_status = 'paid', final_payment_id = $2
+                     WHERE id = $1::uuid AND payment_status IN ('unpaid', 'settling')
+                """, session_id, payment_intent_id)
         return {"ok": True}
 
-    obj = (event.get("data") or {}).get("object") or {}
-    payment_intent_id = obj.get("id", "") if isinstance(obj, dict) else ""
-    if not payment_intent_id:
+    if status is None or not payment_intent_id:
         return {"ok": True}
 
     async with db.read() as conn:
-        row = await conn.fetchrow("""
-            SELECT id::text AS id, cp_id, connector_id, payment_status
-              FROM ocpp.public_sessions
-             WHERE external_payment_id = $1
-        """, payment_intent_id)
+        if session_id:
+            row = await conn.fetchrow("""
+                SELECT id::text AS id, cp_id, connector_id, payment_status
+                  FROM ocpp.public_sessions WHERE id = $1::uuid
+            """, session_id)
+        else:
+            row = await conn.fetchrow("""
+                SELECT id::text AS id, cp_id, connector_id, payment_status
+                  FROM ocpp.public_sessions WHERE external_payment_id = $1
+            """, payment_intent_id)
     if not row:
         logger.warning("Payment webhook: no session for payment_intent=%s", payment_intent_id)
         return {"ok": True}
@@ -184,20 +206,33 @@ async def payment_webhook(request: Request):
     session_id = row["id"]
     prev_status = row["payment_status"]
 
+    # Releasing the £5 check after the session has started must not cancel it.
+    if status == "cancelled" and prev_status in ("authorized", "paid", "settling", "unpaid"):
+        return {"ok": True}
+    if status == "failed" and prev_status in ("authorized", "paid", "settling", "unpaid"):
+        return {"ok": True}
+
+    customer = obj.get("customer") if isinstance(obj.get("customer"), str) else None
+    method = obj.get("payment_method") if isinstance(obj.get("payment_method"), str) else None
+
     async with db.write() as conn:
         await conn.execute("""
             UPDATE ocpp.public_sessions
-               SET payment_status = $2
+               SET payment_status = $2,
+                   external_payment_id = COALESCE($3, external_payment_id),
+                   stripe_customer_id = COALESCE($4, stripe_customer_id),
+                   stripe_payment_method_id = COALESCE($5, stripe_payment_method_id)
              WHERE id = $1::uuid
-        """, session_id, status)
+        """, session_id, status, payment_intent_id, customer, method)
 
     logger.info("Session %s payment_status → %s (%s)", session_id[:8], status, event.get("type"))
 
-    # Start the charger only once, when the £5 hold is in place.
+    # Start the charger only once, and only when the card can be charged again later.
     if status == "authorized" and prev_status not in ("authorized", "paid"):
-        await _trigger_remote_start(session_id, row["cp_id"], row["connector_id"])
-
-    return {"ok": True}
+        if customer and method:
+            await _trigger_remote_start(session_id, row["cp_id"], row["connector_id"])
+        else:
+            logger.warning("Session %s card check has no saved card; charger not started", session_id[:8])
 
     return {"ok": True}
 
@@ -239,10 +274,31 @@ async def _trigger_remote_start(session_id: str, cp_id: str, connector_id: int) 
                 "id_tag": id_tag,
                 "external_payment_id": external_payment_id,
                 "retries": 0,
-                "created_at": datetime.now(timezone.utc).isoformat(),
             }),
             ttl=120,
         )
+        asyncio.get_running_loop().create_task(_release_if_never_started(session_id))
+
+
+async def _release_if_never_started(session_id: str) -> None:
+    """Release the £5 check if the charger has not started within three minutes."""
+    await asyncio.sleep(180)
+    async with db.read() as conn:
+        row = await conn.fetchrow("""
+            SELECT payment_status, ocpp_transaction_id, external_payment_id
+              FROM ocpp.public_sessions WHERE id = $1::uuid
+        """, session_id)
+    if not row or row["ocpp_transaction_id"] or row["payment_status"] != "authorized":
+        return
+    from api.stripe_billing import cancel_hold
+    await cancel_hold(row["external_payment_id"])
+    async with db.write() as conn:
+        await conn.execute("""
+            UPDATE ocpp.public_sessions
+               SET payment_status = 'cancelled', stopped_at = NOW()
+             WHERE id = $1::uuid AND ocpp_transaction_id IS NULL
+        """, session_id)
+    logger.info("Released card check for session %s; charger did not start", session_id[:8])
 
 
 async def _fail_pending_start(data: dict) -> None:

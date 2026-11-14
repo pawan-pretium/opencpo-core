@@ -46,7 +46,8 @@ async def send_sms(to: str, message: str) -> bool:
 def _normalise_phone(phone: str) -> str:
     phone = phone.strip().replace(" ", "")
     if not phone.startswith("+"):
-        phone = ("+31" + phone[1:]) if phone.startswith("0") else ("+" + phone)
+        # UK numbers: a leading 0 is the trunk prefix, so 07… becomes +447…
+        phone = ("+44" + phone[1:]) if phone.startswith("0") else ("+" + phone)
     return phone
 
 
@@ -101,6 +102,8 @@ async def _send_twilio(phone: str, message: str, cfg: dict) -> bool:
         return False
 
     import base64
+    # Main Twilio region. The Ireland (IE1) region rejects UK numbers with error 21408
+    # even when United Kingdom is enabled there.
     url     = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
     body    = f"To={urllib.parse.quote(phone)}&From={urllib.parse.quote(from_number)}&Body={urllib.parse.quote(message)}".encode()
     creds   = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode()
