@@ -321,14 +321,15 @@ async def _create_invoice(row) -> tuple[str, int, str | None]:
     return lago_id, total, "; ".join(notes) or None
 
 
-async def _send_text(row) -> None:
+async def _send_text(row) -> bool:
     phone = (row["driver_phone"] or "").strip()
     if not phone:
-        return
+        return False
     from utils import send_sms
 
     text = REGISTERED_TEXT if row["registered"] else GUEST_TEXT
     await send_sms(phone, text)
+    return True
 
 
 async def prepare_session(session_id: str, kwh: float) -> dict | None:
@@ -340,6 +341,7 @@ async def prepare_session(session_id: str, kwh: float) -> dict | None:
             """
             SELECT s.id::text AS session_id, s.energy_kwh, s.charge_point,
                    s.start_time, s.stop_time, s.simulated,
+                   s.metadata->>'unapproved' AS unapproved,
                    ps.id::text AS public_session_id,
                    ps.driver_email, ps.driver_phone,
                    ps.driver_account_id::text AS driver_account_id,
@@ -360,7 +362,7 @@ async def prepare_session(session_id: str, kwh: float) -> dict | None:
             """,
             session_id,
         )
-    if not row or row["simulated"]:
+    if not row or row["simulated"] or row["unapproved"] == "true":
         return None
     if kwh <= 0:
         return None
@@ -466,14 +468,14 @@ async def deliver_session(session_id: str) -> bool:
         return False
 
     await _send_invoice_email(row)
-    if not row["sms_sent"]:
+    if not row["sms_sent"] and (row["driver_phone"] or "").strip():
         try:
-            await _send_text(row)
-            async with db.write() as conn:
-                await conn.execute(
-                    "UPDATE ocpp.session_invoices SET sms_sent = TRUE WHERE session_id = $1",
-                    session_id,
-                )
+            if await _send_text(row):
+                async with db.write() as conn:
+                    await conn.execute(
+                        "UPDATE ocpp.session_invoices SET sms_sent = TRUE WHERE session_id = $1",
+                        session_id,
+                    )
         except Exception as exc:
             logger.warning("Invoice text failed for %s: %s", session_id, exc)
 
@@ -535,11 +537,6 @@ async def _send_invoice_email(row) -> None:
         return
     email = (row["driver_email"] or "").strip()
     if not email:
-        async with db.write() as conn:
-            await conn.execute(
-                "UPDATE ocpp.session_invoices SET emailed = TRUE WHERE session_id = $1",
-                row["session_id"],
-            )
         return
     try:
         from utils import send_email
@@ -723,8 +720,8 @@ async def retry_pending() -> None:
             SELECT session_id FROM ocpp.session_invoices
              WHERE lago_invoice_id IS NULL
                 OR (payment_marked AND NOT lago_paid)
-                OR NOT emailed
-                OR NOT sms_sent
+                OR (NOT emailed AND COALESCE(driver_email, '') <> '')
+                OR (NOT sms_sent AND COALESCE(driver_phone, '') <> '')
              ORDER BY created_at
              LIMIT 100
             """

@@ -389,7 +389,7 @@ async def list_cpo_invoices(limit: int = 100, offset: int = 0):
             """
             SELECT invoice_number, reference, charge_point, driver_email,
                    kwh, ex_vat_pence, vat_pence, total_pence, payment_marked,
-                   lago_mismatch, created_at, session_id
+                   emailed, lago_mismatch, created_at, session_id
               FROM ocpp.session_invoices
              ORDER BY created_at DESC
              LIMIT $1 OFFSET $2
@@ -410,6 +410,7 @@ async def list_cpo_invoices(limit: int = 100, offset: int = 0):
                 "vat": (r["vat_pence"] or 0) / 100,
                 "total": (r["total_pence"] or 0) / 100,
                 "paid": bool(r["payment_marked"]),
+                "emailed": bool(r["emailed"]),
                 "lago_mismatch": r["lago_mismatch"] or "",
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }

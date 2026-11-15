@@ -17,6 +17,38 @@ from utils import parse_timestamp
 logger = logging.getLogger(__name__)
 
 
+async def _start_allowed(cp_id: str, connector_id: int, id_tag: str) -> bool:
+    """A charge may start from the CPO app, a staff remote start, or an active token.
+
+    A car's own app, or a tag such as NoAuthorization, is not an approval.
+    """
+    if id_tag == "REMOTE":
+        return True
+    if id_tag.startswith("APP_") and len(id_tag) >= 12:
+        prefix = id_tag[4:].lower()
+        async with db.read() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 1 FROM ocpp.public_sessions
+                 WHERE LEFT(id::text, 8) = $1
+                   AND cp_id = $2
+                   AND connector_id = $3
+                   AND payment_status IN ('authorized', 'paid')
+                   AND started_at IS NULL
+                   AND ocpp_transaction_id IS NULL
+                 LIMIT 1
+                """,
+                prefix, cp_id, connector_id,
+            )
+        return row is not None
+    async with db.read() as conn:
+        token = await conn.fetchrow(
+            "SELECT 1 FROM ocpp.tokens WHERE uid = $1 AND status = 'active'",
+            id_tag,
+        )
+    return token is not None
+
+
 async def handle_start_transaction(
     cp_id: str,
     event_bus: EventBus,
@@ -78,6 +110,29 @@ async def handle_start_transaction(
     ))
 
     logger.info(f"[{cp_id}] Session started: txn={transaction_id} tag={id_tag} connector={connector_id}")
+
+    if not await _start_allowed(cp_id, connector_id, id_tag):
+        async with db.write() as conn:
+            await conn.execute(
+                """
+                UPDATE ocpp.sessions
+                   SET metadata = metadata || '{"unapproved": true}'::jsonb
+                 WHERE id = $1
+                """,
+                session["id"],
+            )
+        logger.warning(
+            "[%s] Start refused: tag=%s has no CPO approval. Stopping txn=%s",
+            cp_id, id_tag, transaction_id,
+        )
+        from state.charger_registry import send_command
+        await send_command(
+            cp_id, "RemoteStopTransaction", {"transactionId": int(transaction_id)}
+        )
+        return {
+            "transactionId": transaction_id,
+            "idTagInfo": {"status": AuthorizationStatus.BLOCKED},
+        }
 
     # Link to public session if APP_ tag (charge app payment flow)
     if id_tag.startswith("APP_"):
