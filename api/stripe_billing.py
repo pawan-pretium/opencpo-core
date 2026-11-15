@@ -10,9 +10,9 @@ next session is refused until that link is paid.
 import asyncio
 import logging
 import os
-from decimal import Decimal, ROUND_HALF_UP
-
 import httpx
+
+from money import incl_vat_pence
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +36,8 @@ def _app_url() -> str:
 
 
 def session_amount_pence(kwh, rate_kwh) -> int:
-    """Price in pence at the rate the driver was shown, capped at £100."""
-    amount = (Decimal(str(kwh or 0)) * Decimal(str(rate_kwh or 0))).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    pence = int(amount * 100)
+    """Ex-VAT rate times kWh, then 20% VAT, in pence, capped at £100."""
+    pence = incl_vat_pence(kwh, rate_kwh)
     if pence < 0:
         return 0
     return min(pence, SESSION_CAP_PENCE)

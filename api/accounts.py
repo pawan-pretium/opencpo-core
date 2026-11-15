@@ -15,6 +15,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import bcrypt
+
+from money import ex_vat_amount, incl_vat_amount, rate_or_fallback
 import jwt
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr
@@ -305,8 +307,8 @@ async def get_account_sessions(request: Request, limit: int = 50, offset: int = 
             duration_min = int(delta.total_seconds() / 60)
 
         kwh = float(r["kwh_delivered"]) if r["kwh_delivered"] else 0.0
-        rate = float(r["rate_kwh"]) if r["rate_kwh"] else 0.35
-        cost = round(kwh * rate, 2)
+        rate = float(rate_or_fallback(r["rate_kwh"]))
+        cost = float(incl_vat_amount(ex_vat_amount(kwh, rate)))
 
         sessions.append({
             "id": r["id"],

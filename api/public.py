@@ -16,6 +16,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request, Response
 from typing import Optional
 
+from money import ex_vat_amount, incl_vat_amount, rate_or_fallback
 from state.postgres import db
 from state import charger_registry
 from state.redis import redis_state
@@ -84,7 +85,7 @@ async def chargers_nearby(
                     if conn_id > 0:
                         connectors.append({"id": conn_id, "type": "CCS2", "status": val})
 
-        energy_rate = float(r["tariff_kwh"]) if r["tariff_kwh"] else 0.35
+        energy_rate = 0.50 if r["tariff_kwh"] is None else float(r["tariff_kwh"])
         chargers.append({
             "id": r["id"],
             "name": r["display_name"] or r["id"],
@@ -356,7 +357,9 @@ async def list_receipt_sessions(limit: int = 100, offset: int = 0):
                 "driver_email": r["driver_email"] or "",
                 "kwh": round(float(r["kwh_delivered"]), 2),
                 "rate_kwh": round(float(r["rate_kwh"] or 0), 4),
-                "cost_incl": round(float(r["kwh_delivered"]) * float(r["rate_kwh"] or 0) * 1.21, 2),
+                "cost_incl": float(incl_vat_amount(ex_vat_amount(
+                    r["kwh_delivered"], rate_or_fallback(r["rate_kwh"])
+                ))),
                 "started_at": r["started_at"].isoformat() if r["started_at"] else None,
                 "stopped_at": r["stopped_at"].isoformat() if r["stopped_at"] else None,
                 "payment_status": r["payment_status"],

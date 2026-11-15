@@ -151,7 +151,7 @@ class StepPkiRequest(BaseModel):
 
 class StepPricingRequest(BaseModel):
     currency: str = "GBP"
-    default_rate_kwh: float = 0.35
+    default_rate_kwh: float = 0.50
     tariff_name: str = "Standard Rate"
 
 

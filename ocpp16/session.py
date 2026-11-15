@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import httpx
 
 from config import config
+from money import ex_vat_amount, incl_vat_amount, rate_or_fallback
 from events.bus import EventBus
 from events.types import Event, EventType
 from state.postgres import db
@@ -212,12 +213,12 @@ async def _notify_session_complete(
             return  # No public session (e.g. RFID session) — skip
 
         public_id = row["public_id"]
-        rate_kwh = float(row["rate_kwh"] or 0)
-        cost = energy_kwh * rate_kwh * 1.20  # incl VAT (UK 20%)
+        rate_kwh = rate_or_fallback(row["rate_kwh"])
+        cost = incl_vat_amount(ex_vat_amount(energy_kwh, rate_kwh))
 
         # Push notification
-        title = "⚡ Laden voltooid"
-        body = f"{energy_kwh:.2f} kWh geladen — €{cost:.2f}".replace(".", ",")
+        title = "Charging complete"
+        body = f"{energy_kwh:.2f} kWh charged — £{cost:.2f} including 20% VAT"
         url = f"/receipt/{public_id}"
 
         # Push notification via standalone push service
@@ -282,14 +283,14 @@ async def _send_receipt_email(
 
         pdf_bytes = generate_receipt_pdf(dict(session_data))
 
-        cost_str = f"€{cost:.2f}".replace(".", ",")
-        kwh_str  = f"{energy_kwh:.2f}".replace(".", ",")
-        subject  = f"Charging receipt — {kwh_str} kWh — {cost_str}"
-        body     = (
+        cost_str = f"£{cost:.2f}"
+        kwh_str = f"{energy_kwh:.2f}"
+        subject = f"Charging receipt — {kwh_str} kWh — {cost_str}"
+        body = (
             f"Dear customer,\n\n"
             f"Session: {session_id[:8].upper()}\n"
             f"Energy:  {kwh_str} kWh\n"
-            f"Amount:  {cost_str} (incl. VAT)\n\n"
+            f"Amount:  {cost_str} including 20% VAT\n\n"
             f"Your receipt is attached.\n"
         )
 
@@ -306,13 +307,12 @@ async def _send_receipt_email(
         logger.warning(f"Receipt email failed for {session_id[:8]} to {email}: {e}")
 
 
-def _calculate_cdr_cost(energy_kwh: float, tariff_rate: Decimal = Decimal("0.35")) -> dict:
-    """Calculate CDR cost using Decimal arithmetic. Returns cost JSONB dict."""
+def _calculate_cdr_cost(energy_kwh: float, tariff_rate: Decimal = Decimal("0.50")) -> dict:
+    """Ex-VAT energy cost, VAT at 20%, and the total. Returns the CDR cost dict."""
     energy = Decimal(str(energy_kwh))
-    energy_cost = (energy * tariff_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    vat_rate = Decimal("0.20")
-    vat_amount = (energy_cost * vat_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    total = energy_cost + vat_amount
+    energy_cost = ex_vat_amount(energy_kwh, tariff_rate)
+    total = incl_vat_amount(energy_cost)
+    vat_amount = total - energy_cost
     return {
         "energy_kwh": float(energy),
         "rate_kwh": float(tariff_rate),
@@ -337,9 +337,15 @@ async def generate_cdr(
     import json
     async with db.write() as c:
         session = await c.fetchrow("""
-            SELECT charge_point, connector_id, auth_method, auth_id,
-                   start_time, stop_time, energy_kwh
-            FROM ocpp.sessions WHERE id::text = $1
+            SELECT s.charge_point, s.connector_id, s.auth_method, s.auth_id,
+                   s.start_time, s.stop_time, s.energy_kwh,
+                   ps.rate_kwh AS session_rate,
+                   cp.metadata->>'tariff_kwh' AS tariff_kwh
+              FROM ocpp.sessions s
+              LEFT JOIN ocpp.public_sessions ps
+                ON ps.ocpp_transaction_id = s.transaction_id
+              LEFT JOIN ocpp.charge_points cp ON cp.id = s.charge_point
+             WHERE s.id::text = $1
         """, session_id)
 
         if not session:
@@ -352,7 +358,13 @@ async def generate_cdr(
 
         # Calculate cost with Decimal arithmetic
         try:
-            cost_json = _calculate_cdr_cost(float(session["energy_kwh"]))
+            stored_rate = session["session_rate"]
+            if stored_rate is None:
+                stored_rate = session["tariff_kwh"]
+            cost_json = _calculate_cdr_cost(
+                float(session["energy_kwh"]),
+                rate_or_fallback(stored_rate),
+            )
         except Exception as exc:
             logger.warning(f"[{cp_id}] Failed to calculate CDR cost for session {session_id}: {exc}")
             cost_json = None

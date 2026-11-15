@@ -17,11 +17,13 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from events.bus import EventBus
 from events.types import EventType
+from money import ex_vat_pence, rate_or_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,8 @@ CREATE TABLE IF NOT EXISTS ocpp.lago_outbox (
     kwh                     REAL        NOT NULL,
     event_ts                TEXT,
     charge_point            TEXT,
+    amount_pence            INTEGER,
+    line                    TEXT,
     attempts                INTEGER     NOT NULL DEFAULT 0,
     last_error              TEXT,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -53,29 +57,91 @@ async def _ensure_outbox() -> None:
 
     async with db.write() as conn:
         await conn.execute(_OUTBOX_DDL)
+        await conn.execute(
+            "ALTER TABLE ocpp.lago_outbox ADD COLUMN IF NOT EXISTS amount_pence INTEGER"
+        )
+        await conn.execute(
+            "ALTER TABLE ocpp.lago_outbox ADD COLUMN IF NOT EXISTS line TEXT"
+        )
 
 
-async def _resolve_subscription(charge_point: str) -> str | None:
+async def _resolve_subscription(session_id: str) -> str | None:
     """
-    Resolve a charge point to its Lago external_subscription_id.
+    Resolve a session to its Lago external_subscription_id.
 
-    Returns external_subscription_id or None if not billable (no group
-    with a billing method).
+    Uses the session's auth_id (OCPP idTag / token uid) → tokens →
+    token_groups. Only invoice and direct_debit groups are billable.
+    Prepaid and card sessions are not sent. The token group's UUID is
+    the subscription id (no external_id column).
+
+    Returns external_subscription_id or None if not billable.
     """
     from state.postgres import db
 
-    async with db.read() as c:
-        row = await c.fetchrow("""
-            SELECT g.external_id
-            FROM ocpp.charge_points cp
-            JOIN ocpp.groups g ON cp.group_id = g.id
-            WHERE cp.id = $1 AND g.billing_method IS NOT NULL
-        """, charge_point)
+    try:
+        async with db.read() as c:
+            row = await c.fetchrow(
+                """
+                SELECT tg.id AS group_id, tg.billing_method, s.billing_type,
+                       s.charge_point, s.start_time, s.stop_time,
+                       s.energy_kwh, ps.rate_kwh AS session_rate,
+                       cp.metadata->>'tariff_kwh' AS tariff_kwh,
+                       cp.metadata->>'display_name' AS display_name,
+                       cp.metadata->>'address' AS address,
+                       cp.metadata->>'city' AS city,
+                       cp.site
+                  FROM ocpp.sessions s
+                  JOIN ocpp.tokens t ON t.uid = s.auth_id
+                  JOIN ocpp.token_groups tg ON tg.id = t.group_id
+                  LEFT JOIN ocpp.public_sessions ps
+                    ON ps.ocpp_transaction_id = s.transaction_id
+                  LEFT JOIN ocpp.charge_points cp ON cp.id = s.charge_point
+                 WHERE s.id = $1::uuid
+                """,
+                session_id,
+            )
+    except Exception as exc:
+        logger.error(
+            "Lago subscription lookup failed for session %s: %s",
+            session_id,
+            exc,
+        )
+        return None
 
-    if row and row["external_id"]:
-        return f"{row['external_id']}_{os.getenv('LAGO_SUBSCRIPTION_SUFFIX', 'fleet_001')}"
+    if not row:
+        return None
 
-    return None
+    # Card / driver-app sessions are prepaid; do not invoice them again.
+    if (row["billing_type"] or "prepaid") == "prepaid":
+        return None
+
+    if row["billing_method"] not in ("invoice", "direct_debit"):
+        return None
+
+    suffix = os.getenv("LAGO_SUBSCRIPTION_SUFFIX", "fleet_001")
+    return f"{row['group_id']}_{suffix}", row
+
+
+def _british_time(value) -> str:
+    """Day, month, year and 24-hour time in London. Example: 4 Oct 2026 10:19."""
+    if value is None:
+        return "unknown time"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local = value.astimezone(ZoneInfo("Europe/London"))
+    return f"{local.day} {local.strftime('%b %Y %H:%M')}"
+
+
+def _invoice_line(session_id: str, row) -> str:
+    """One invoice line for one session."""
+    name = row["display_name"] or row["charge_point"] or "charger"
+    place = row["address"] or row["site"] or row["city"] or "site not recorded"
+    start = _british_time(row["start_time"])
+    end = _british_time(row["stop_time"])
+    return (
+        f"Energy consumed at the {name}, {place}, "
+        f"session {session_id} ({start} to {end})"
+    )
 
 
 async def _send_to_lago(
@@ -84,8 +150,10 @@ async def _send_to_lago(
     kwh: float,
     timestamp: str,
     charge_point: str,
+    amount_pence: int,
+    line: str,
 ) -> tuple[bool, str]:
-    """Send one billable event to Lago. Returns (accepted, error_text)."""
+    """Send one session to Lago at the ex-VAT amount. Returns (accepted, error_text)."""
     if not LAGO_API_KEY:
         return False, "LAGO_API_KEY not configured"
 
@@ -97,8 +165,11 @@ async def _send_to_lago(
             "timestamp": int(datetime.fromisoformat(timestamp).timestamp())
             if timestamp
             else int(datetime.now(timezone.utc).timestamp()),
+            "precise_total_amount_cents": str(int(amount_pence)),
             "properties": {
-                "kwh": round(kwh, 3),
+                "kwh": round(float(kwh), 3),
+                "charge_point": charge_point or "",
+                "line": line,
             },
         }
     }
@@ -136,6 +207,8 @@ async def _record(
     kwh: float,
     timestamp: str,
     charge_point: str,
+    amount_pence: int,
+    line: str,
 ) -> None:
     """Store a billable event in the outbox until Lago accepts it."""
     from state.postgres import db
@@ -143,10 +216,12 @@ async def _record(
     async with db.write() as conn:
         await conn.execute("""
             INSERT INTO ocpp.lago_outbox
-                (transaction_id, subscription_id, kwh, event_ts, charge_point)
-            VALUES ($1, $2, $3, $4, $5)
+                (transaction_id, subscription_id, kwh, event_ts, charge_point,
+                 amount_pence, line)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (transaction_id) DO NOTHING
-        """, transaction_id, subscription_id, kwh, timestamp, charge_point)
+        """, transaction_id, subscription_id, kwh, timestamp, charge_point,
+             amount_pence, line)
 
 
 async def _deliver(row) -> bool:
@@ -159,6 +234,8 @@ async def _deliver(row) -> bool:
         kwh=row["kwh"],
         timestamp=row["event_ts"] or "",
         charge_point=row["charge_point"] or "",
+        amount_pence=row["amount_pence"] or 0,
+        line=row["line"] or "",
     )
     async with db.write() as conn:
         if accepted:
@@ -186,7 +263,8 @@ async def _retry_loop() -> None:
         try:
             async with db.read() as conn:
                 rows = await conn.fetch("""
-                    SELECT transaction_id, subscription_id, kwh, event_ts, charge_point
+                    SELECT transaction_id, subscription_id, kwh, event_ts,
+                           charge_point, amount_pence, line
                       FROM ocpp.lago_outbox
                   ORDER BY created_at
                      LIMIT $1
@@ -236,13 +314,21 @@ async def run(event_bus: EventBus) -> None:
             logger.debug(f"Skipping zero-energy CDR: {session_id}")
             continue
 
-        subscription_id = await _resolve_subscription(charge_point)
-        if not subscription_id:
+        resolved = await _resolve_subscription(session_id)
+        if not resolved:
             logger.info(
-                f"No billable subscription for {charge_point} — "
-                f"session {session_id} ({kwh:.3f} kWh) not billed"
+                f"No billable subscription for session {session_id} "
+                f"({charge_point}, {kwh:.3f} kWh) — not sent to Lago"
             )
             continue
+
+        subscription_id, session_row = resolved
+        stored_rate = session_row["session_rate"]
+        if stored_rate is None:
+            stored_rate = session_row["tariff_kwh"]
+        rate = rate_or_fallback(stored_rate)
+        amount_pence = ex_vat_pence(kwh, rate)
+        line = _invoice_line(session_id, session_row)
 
         # Transaction ID = session_id (idempotent — Lago deduplicates)
         await _record(
@@ -251,6 +337,8 @@ async def run(event_bus: EventBus) -> None:
             kwh=kwh,
             timestamp=event.timestamp,
             charge_point=charge_point,
+            amount_pence=amount_pence,
+            line=line,
         )
         await _deliver({
             "transaction_id": session_id,
@@ -258,4 +346,6 @@ async def run(event_bus: EventBus) -> None:
             "kwh": kwh,
             "event_ts": event.timestamp,
             "charge_point": charge_point,
+            "amount_pence": amount_pence,
+            "line": line,
         })

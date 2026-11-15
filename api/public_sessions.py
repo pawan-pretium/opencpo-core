@@ -157,7 +157,7 @@ async def create_session(req: SessionCreate):
         tier_data = await get_tier_rate(resolved_tier)
         spot_price_at_start = await get_spot_price()
         cost_basis_at_start, _ = await get_cost_basis()
-        rate_kwh = tier_data["rate_incl"]  # driver pays incl. tax
+        rate_kwh = tier_data["rate_excl"]  # stored rate is ex-VAT
         pricing_tier = resolved_tier
     except Exception as exc:
         logger.warning(
@@ -168,7 +168,8 @@ async def create_session(req: SessionCreate):
             tariff_row = await conn.fetchrow(
                 "SELECT metadata->>'tariff_kwh' AS tariff_kwh FROM ocpp.charge_points WHERE id = $1", req.cp_id
             )
-        rate_kwh = float(tariff_row["tariff_kwh"]) if tariff_row and tariff_row["tariff_kwh"] else 0.35
+        raw_tariff = tariff_row["tariff_kwh"] if tariff_row else None
+        rate_kwh = 0.50 if raw_tariff in (None, "") else float(raw_tariff)
         spot_price_at_start = None
         cost_basis_at_start = None
         pricing_tier = resolved_tier

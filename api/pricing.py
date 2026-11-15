@@ -101,12 +101,8 @@ async def get_cost_basis() -> tuple[float, dict[str, float]]:
 
 
 async def get_tax_rate() -> float:
-    """Fetch tax rate from config (falls back to btw_rate for backward compat)."""
-    async with db.read() as conn:
-        row = await conn.fetchrow(
-            "SELECT value FROM ocpp.pricing_config WHERE key IN ('tax_rate', 'btw_rate') ORDER BY key LIMIT 1"
-        )
-    return float(row["value"]) if row else 0.20  # UK standard VAT
+    """UK VAT. A stored btw_rate is not used."""
+    return 0.20
 
 
 async def get_tier_rate(tier_id: str) -> dict:
