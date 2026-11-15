@@ -84,7 +84,7 @@ async def remote_start(cp_id: str, req: RemoteStartRequest):
 @router.post("/{cp_id}/stop", dependencies=[Depends(management_auth)])
 async def remote_stop(cp_id: str, transaction_id: int = Query(None), connector_id: int = Query(None)):
     """Send RemoteStopTransaction to a charger."""
-    from state.charger_registry import send_remote_stop, is_connected
+    from state.charger_registry import send_command, is_connected
 
     if not is_connected(cp_id):
         raise HTTPException(400, f"Charger {cp_id} is not connected")
@@ -105,7 +105,9 @@ async def remote_stop(cp_id: str, transaction_id: int = Query(None), connector_i
             raise HTTPException(400, f"No active session found for {cp_id}" + (f" connector {connector_id}" if connector_id else ""))
         transaction_id = row["transaction_id"]
 
-    msg_id = await send_remote_stop(cp_id, transaction_id)
+    msg_id = await send_command(
+        cp_id, "RemoteStopTransaction", {"transactionId": int(transaction_id)}
+    )
     if msg_id is None:
         raise HTTPException(502, f"Failed to send RemoteStopTransaction to {cp_id}")
 
