@@ -16,7 +16,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request, Response
 from typing import Optional
 
-from money import ex_vat_amount, incl_vat_amount, rate_or_fallback
+from money import ex_vat_amount, incl_vat_amount, rate_or_fallback, session_cost_pence
 from state.postgres import db
 from state import charger_registry
 from state.redis import redis_state
@@ -184,6 +184,13 @@ async def payment_webhook(request: Request):
                        SET payment_status = 'paid', final_payment_id = $2
                      WHERE id = $1::uuid AND payment_status IN ('unpaid', 'settling')
                 """, session_id, payment_intent_id)
+            # A Stripe retry finds the row already paid (UPDATE 0). Still
+            # mark the invoice: the first attempt may have missed Lago.
+            try:
+                from lago_invoice import mark_paid_for_public_session
+                await mark_paid_for_public_session(session_id)
+            except Exception as exc:
+                logger.warning("Lago paid mark failed for %s: %s", session_id, exc)
         return {"ok": True}
 
     if status is None or not payment_intent_id:
@@ -357,9 +364,9 @@ async def list_receipt_sessions(limit: int = 100, offset: int = 0):
                 "driver_email": r["driver_email"] or "",
                 "kwh": round(float(r["kwh_delivered"]), 2),
                 "rate_kwh": round(float(r["rate_kwh"] or 0), 4),
-                "cost_incl": float(incl_vat_amount(ex_vat_amount(
-                    r["kwh_delivered"], rate_or_fallback(r["rate_kwh"])
-                ))),
+                "cost_incl": session_cost_pence(
+                    r["kwh_delivered"], rate_or_fallback(r["rate_kwh"]), r["cp_id"]
+                ) / 100,
                 "started_at": r["started_at"].isoformat() if r["started_at"] else None,
                 "stopped_at": r["stopped_at"].isoformat() if r["stopped_at"] else None,
                 "payment_status": r["payment_status"],
@@ -369,6 +376,60 @@ async def list_receipt_sessions(limit: int = 100, offset: int = 0):
         ],
         "total": count,
     }
+
+
+@mgmt_public_router.get("/invoices")
+async def list_cpo_invoices(limit: int = 100, offset: int = 0):
+    """Every CPO invoice, for the admin portal."""
+    from lago_invoice import ensure_schema
+
+    await ensure_schema()
+    async with db.read() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT invoice_number, reference, charge_point, driver_email,
+                   kwh, ex_vat_pence, vat_pence, total_pence, payment_marked,
+                   lago_mismatch, created_at, session_id
+              FROM ocpp.session_invoices
+             ORDER BY created_at DESC
+             LIMIT $1 OFFSET $2
+            """,
+            limit, offset,
+        )
+        count = await conn.fetchval("SELECT COUNT(*) FROM ocpp.session_invoices")
+    return {
+        "invoices": [
+            {
+                "session_id": r["session_id"],
+                "invoice_number": r["invoice_number"],
+                "reference": r["reference"],
+                "charge_point": r["charge_point"],
+                "driver_email": r["driver_email"] or "",
+                "kwh": r["kwh"],
+                "ex_vat": (r["ex_vat_pence"] or 0) / 100,
+                "vat": (r["vat_pence"] or 0) / 100,
+                "total": (r["total_pence"] or 0) / 100,
+                "paid": bool(r["payment_marked"]),
+                "lago_mismatch": r["lago_mismatch"] or "",
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+        "total": count,
+    }
+
+
+@mgmt_public_router.get("/invoices/{session_id}/pdf")
+async def download_cpo_invoice(session_id: str):
+    """The CPO PDF for one session."""
+    from lago_invoice import invoice_pdf_for_staff
+
+    pdf = await invoice_pdf_for_staff(session_id)
+    if not pdf:
+        raise HTTPException(404, "Invoice not found")
+    return Response(content=pdf, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="invoice-{session_id[:8]}.pdf"',
+    })
 
 
 # ── Certificate Identity ─────────────────────────────────────────────────

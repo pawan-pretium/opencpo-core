@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import httpx
 
 from config import config
-from money import ex_vat_amount, incl_vat_amount, rate_or_fallback
+from money import rate_or_fallback, session_breakdown, session_cost_pence
 from events.bus import EventBus
 from events.types import Event, EventType
 from state.postgres import db
@@ -202,7 +202,7 @@ async def _notify_session_complete(
         # Look up public session by ocpp_transaction_id to get rate and public session id
         async with db.read() as conn:
             row = await conn.fetchrow("""
-                SELECT id::text as public_id, rate_kwh, driver_email, driver_phone,
+                SELECT id::text as public_id, cp_id, rate_kwh, driver_email, driver_phone,
                        driver_account_id
                 FROM ocpp.public_sessions
                 WHERE ocpp_transaction_id = $1
@@ -213,8 +213,8 @@ async def _notify_session_complete(
             return  # No public session (e.g. RFID session) — skip
 
         public_id = row["public_id"]
-        rate_kwh = rate_or_fallback(row["rate_kwh"])
-        cost = incl_vat_amount(ex_vat_amount(energy_kwh, rate_kwh))
+        # Same figure as the screen, receipt and invoice: fee added once, incl. VAT.
+        cost = session_cost_pence(energy_kwh, rate_or_fallback(row["rate_kwh"]), row["cp_id"]) / 100
 
         # Push notification
         title = "Charging complete"
@@ -240,89 +240,28 @@ async def _notify_session_complete(
         except Exception as e:
             logger.warning("In-process push failed: %s", e)
 
-        # Receipt email — resolve email from session or driver account
-        email = row["driver_email"]
-        if not email and row["driver_account_id"]:
-            async with db.read() as conn:
-                acct = await conn.fetchrow(
-                    "SELECT email FROM ocpp.driver_accounts WHERE id = $1",
-                    row["driver_account_id"],
-                )
-            if acct:
-                email = acct["email"]
-
-        if email and energy_kwh > 0:
-            await _send_receipt_email(public_id, email, energy_kwh, cost)
-
     except Exception as e:
         logger.warning(f"Session completion notification failed for {ocpp_session_id}: {e}")
 
 
-async def _send_receipt_email(
-    session_id: str, email: str, energy_kwh: float, cost: float
-) -> None:
-    """Generate receipt PDF and email it to the driver (best-effort, non-blocking)."""
-    from utils import send_email
-    try:
-        from api.receipt_pdf import generate_receipt_pdf
-        async with db.read() as conn:
-            session_data = await conn.fetchrow("""
-                SELECT ps.id::text AS id, ps.cp_id, ps.connector_id,
-                       ps.kwh_delivered, ps.rate_kwh, ps.started_at, ps.stopped_at,
-                       ps.driver_email, ps.driver_phone,
-                       cp.metadata->>'display_name' AS display_name,
-                       cp.metadata->>'address' AS address,
-                       cp.metadata->>'city' AS city
-                  FROM ocpp.public_sessions ps
-                  LEFT JOIN ocpp.charge_points cp ON cp.id = ps.cp_id
-                 WHERE ps.id = $1::uuid
-            """, session_id)
-
-        if not session_data:
-            return
-
-        pdf_bytes = generate_receipt_pdf(dict(session_data))
-
-        cost_str = f"£{cost:.2f}"
-        kwh_str = f"{energy_kwh:.2f}"
-        subject = f"Charging receipt — {kwh_str} kWh — {cost_str}"
-        body = (
-            f"Dear customer,\n\n"
-            f"Session: {session_id[:8].upper()}\n"
-            f"Energy:  {kwh_str} kWh\n"
-            f"Amount:  {cost_str} including 20% VAT\n\n"
-            f"Your receipt is attached.\n"
-        )
-
-        await send_email(
-            to_email=email,
-            subject=subject,
-            body_text=body,
-            attachment_bytes=pdf_bytes,
-            attachment_name=f"Receipt-{session_id[:8].upper()}.pdf",
-        )
-        logger.info(f"Receipt email sent to {email} for session {session_id[:8]}")
-
-    except Exception as e:
-        logger.warning(f"Receipt email failed for {session_id[:8]} to {email}: {e}")
-
-
-def _calculate_cdr_cost(energy_kwh: float, tariff_rate: Decimal = Decimal("0.50")) -> dict:
-    """Ex-VAT energy cost, VAT at 20%, and the total. Returns the CDR cost dict."""
-    energy = Decimal(str(energy_kwh))
-    energy_cost = ex_vat_amount(energy_kwh, tariff_rate)
-    total = incl_vat_amount(energy_cost)
-    vat_amount = total - energy_cost
+def _calculate_cdr_cost(
+    energy_kwh: float,
+    tariff_rate: Decimal = Decimal("0.50"),
+    charge_point: str | None = None,
+) -> dict:
+    """The capped invoice total: energy, the connection fee, overshoot, and 20% VAT."""
+    lines = session_breakdown(energy_kwh, tariff_rate, charge_point)
     return {
-        "energy_kwh": float(energy),
+        "energy_kwh": float(energy_kwh),
         "rate_kwh": float(tariff_rate),
-        "energy_cost": float(energy_cost),
+        "energy_cost": lines["energy_pence"] / 100,
         "time_cost": 0.0,
-        "flat_fee": 0.0,
-        "subtotal": float(energy_cost),
+        "flat_fee": lines["fee_pence"] / 100,
+        "overshoot": lines["overshoot_pence"] / 100,
+        "subtotal": lines["ex_vat_pence"] / 100,
         "vat_rate": 20.0,
-        "vat_amount": float(vat_amount),
-        "total": float(total),
+        "vat_amount": lines["vat_pence"] / 100,
+        "total": lines["total_pence"] / 100,
         "currency": "GBP",
     }
 
@@ -364,6 +303,7 @@ async def generate_cdr(
             cost_json = _calculate_cdr_cost(
                 float(session["energy_kwh"]),
                 rate_or_fallback(stored_rate),
+                session["charge_point"],
             )
         except Exception as exc:
             logger.warning(f"[{cp_id}] Failed to calculate CDR cost for session {session_id}: {exc}")

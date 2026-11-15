@@ -2,8 +2,8 @@
 
 The driver pays a £5 card check on Stripe's page before the charger starts.
 That check is released at the end. The card saved during the check is then
-charged for the energy, at the rate shown on the charge screen, up to £100.
-A charge under 30p is not sent to the bank. A failed final charge is tried
+charged for the session, at the invoice total, up to £180 including VAT.
+A £0 pilot session is not sent to the bank. A failed final charge is tried
 three times in total, then the driver is emailed a payment link and their
 next session is refused until that link is paid.
 """
@@ -12,13 +12,12 @@ import logging
 import os
 import httpx
 
-from money import incl_vat_pence
+from money import session_cost_pence
 
 logger = logging.getLogger(__name__)
 
 HOLD_PENCE = 500
-SESSION_CAP_PENCE = 10000
-MIN_CHARGE_PENCE = 30
+SESSION_CAP_PENCE = 18000
 CHARGE_ATTEMPTS = 3
 _API = "https://api.stripe.com/v1"
 
@@ -35,12 +34,9 @@ def _app_url() -> str:
     return os.getenv("CHARGE_APP_URL", "https://app.cpo.pretiumsynergy.co.uk").rstrip("/")
 
 
-def session_amount_pence(kwh, rate_kwh) -> int:
-    """Ex-VAT rate times kWh, then 20% VAT, in pence, capped at £100."""
-    pence = incl_vat_pence(kwh, rate_kwh)
-    if pence < 0:
-        return 0
-    return min(pence, SESSION_CAP_PENCE)
+def session_amount_pence(kwh, rate_kwh, charge_point: str | None = None) -> int:
+    """The CPO invoice total for this session, capped at £180 including VAT."""
+    return min(session_cost_pence(kwh, rate_kwh, charge_point), SESSION_CAP_PENCE)
 
 
 async def _stripe(method: str, path: str, data: dict | None = None) -> dict:
@@ -73,8 +69,10 @@ async def create_card_check(session_id: str, cp_id: str, connector_id: int) -> s
         "payment_intent_data[capture_method]": "manual",
         "payment_intent_data[setup_future_usage]": "off_session",
         "payment_intent_data[metadata][opencpo_session_id]": session_id,
+        "payment_intent_data[metadata][session_id]": session_id,
         "payment_intent_data[metadata][kind]": "hold",
         "metadata[opencpo_session_id]": session_id,
+        "metadata[session_id]": session_id,
     })
     url = session.get("url") or ""
     if not url:
@@ -114,6 +112,7 @@ async def _charge_saved_card(row, pence: int) -> dict:
         "confirm": "true",
         "description": f"Pretium charging {row['cp_id']}",
         "metadata[opencpo_session_id]": row["id"],
+        "metadata[session_id]": row["id"],
         "metadata[kind]": "final",
     })
 
@@ -150,13 +149,19 @@ async def settle_session(transaction_id: int) -> None:
              WHERE ocpp_transaction_id = $1
                AND payment_status = 'authorized'
             RETURNING id::text AS id, cp_id, driver_email, rate_kwh, kwh_delivered,
-                      stripe_customer_id, stripe_payment_method_id, external_payment_id
+                      stripe_customer_id, stripe_payment_method_id, external_payment_id,
+                      amount_due_pence
         """, transaction_id)
     if not row:
         return
 
-    pence = session_amount_pence(row["kwh_delivered"], row["rate_kwh"])
-    if pence < MIN_CHARGE_PENCE:
+    # The invoice total is stored as soon as the session lines are known.
+    # Use that. Fall back to the same sum when it has not been stored yet.
+    if row["amount_due_pence"] is not None:
+        pence = min(int(row["amount_due_pence"]), SESSION_CAP_PENCE)
+    else:
+        pence = session_amount_pence(row["kwh_delivered"], row["rate_kwh"], row["cp_id"])
+    if pence == 0:
         await cancel_hold(row["external_payment_id"])
         async with db.write() as conn:
             await conn.execute("""
@@ -164,6 +169,7 @@ async def settle_session(transaction_id: int) -> None:
                    SET payment_status = 'paid', amount_due_pence = $2
                  WHERE id = $1::uuid
             """, row["id"], pence)
+        await _mark_lago_paid(row["id"])
         return
     if not row["stripe_payment_method_id"]:
         async with db.write() as conn:
@@ -197,6 +203,7 @@ async def settle_session(transaction_id: int) -> None:
                  WHERE id = $1::uuid
             """, row["id"], payment_id, pence)
         logger.info("Session %s charged %s pence", row["id"][:8], pence)
+        await _mark_lago_paid(row["id"])
         return
 
     link = await _payment_link_full(row, pence)
@@ -209,6 +216,15 @@ async def settle_session(transaction_id: int) -> None:
         """, row["id"], pence, link["url"], link["id"])
     await _email_payment_link(row, pence, link["url"])
     logger.info("Session %s left unpaid, link emailed", row["id"][:8])
+
+
+async def _mark_lago_paid(public_session_id: str) -> None:
+    """Stripe succeeded, so the Lago invoice for this session is paid."""
+    try:
+        from lago_invoice import mark_paid_for_public_session
+        await mark_paid_for_public_session(public_session_id)
+    except Exception as exc:
+        logger.warning("Could not mark Lago invoice paid for %s: %s", public_session_id[:8], exc)
 
 
 async def _payment_link_full(row, pence: int) -> dict:
@@ -225,8 +241,10 @@ async def _payment_link_full(row, pence: int) -> dict:
             "line_items[0][price_data][unit_amount]": str(pence),
             "line_items[0][price_data][product_data][name]": "Pretium charging",
             "metadata[opencpo_session_id]": row["id"],
+            "metadata[session_id]": row["id"],
             "metadata[kind]": "debt",
             "payment_intent_data[metadata][opencpo_session_id]": row["id"],
+            "payment_intent_data[metadata][session_id]": row["id"],
             "payment_intent_data[metadata][kind]": "debt",
         })
     except StripeCallError as exc:

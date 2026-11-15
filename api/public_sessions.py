@@ -17,6 +17,7 @@ from state.postgres import db
 from state import charger_registry
 from state.redis import redis_state
 from api.pricing import get_tier_rate, get_spot_price, get_cost_basis
+from money import connection_fee_pence, CAP_INCL_VAT_PENCE
 from utils import send_sms as _send_sms
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,11 @@ async def _refuse_if_unpaid(phone: str | None, email: str | None) -> None:
                 "UPDATE ocpp.public_sessions SET payment_status = 'paid' WHERE id = $1::uuid",
                 row["id"],
             )
+        try:
+            from lago_invoice import mark_paid_for_public_session
+            await mark_paid_for_public_session(row["id"])
+        except Exception as exc:
+            logger.warning("Lago paid mark failed for %s: %s", row["id"], exc)
         return
     link = row["payment_url"] or ""
     raise HTTPException(
@@ -270,6 +276,9 @@ async def get_session(session_id: str):
 
     result = _session_row_to_dict(row)
     result["remote_start_failed"] = (row["payment_status"] == "remote_start_failed")
+    # Ex-VAT pence added once the session has energy. 30 on the fee chargers, else 0.
+    result["connection_fee_pence"] = connection_fee_pence(row["cp_id"])
+    result["session_cap_pence"] = CAP_INCL_VAT_PENCE
 
     # Enrich with live OCPP data if session has a linked transaction
     if row["ocpp_transaction_id"]:

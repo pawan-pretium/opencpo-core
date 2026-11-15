@@ -227,7 +227,7 @@ _cap_stop_sent: set[int] = set()
 
 
 async def _stop_at_session_cap(cp_id: str, transaction_id: int, energy_kwh: float) -> None:
-    """Stop the charger once the energy reaches £100. The session is then charged."""
+    """Stop the charger once the session reaches £180 including VAT."""
     if transaction_id in _cap_stop_sent:
         return
     async with db.read() as conn:
@@ -238,11 +238,11 @@ async def _stop_at_session_cap(cp_id: str, transaction_id: int, energy_kwh: floa
     if not row or row["rate_kwh"] is None:
         return
     from api.stripe_billing import session_amount_pence, SESSION_CAP_PENCE
-    if session_amount_pence(energy_kwh, row["rate_kwh"]) < SESSION_CAP_PENCE:
+    if session_amount_pence(energy_kwh, row["rate_kwh"], cp_id) < SESSION_CAP_PENCE:
         return
     _cap_stop_sent.add(transaction_id)
     from state import charger_registry
     sent = await charger_registry.send_command(
         cp_id, "RemoteStopTransaction", {"transactionId": int(transaction_id)}
     )
-    logger.info("Session cap £100 reached for txn=%s stop_sent=%s", transaction_id, bool(sent))
+    logger.info("Session cap £180 reached for txn=%s stop_sent=%s", transaction_id, bool(sent))

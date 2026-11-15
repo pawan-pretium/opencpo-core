@@ -1,15 +1,12 @@
 """
-Lago Billing Consumer — sends charging events to Lago for invoicing.
+Lago Billing Consumer — one Lago invoice per completed charging session.
 
-Listens for SESSION_CDR events on the event bus and forwards the kWh
-delivered to Lago as billable events. Lago handles invoice generation,
-tax calculation, and payment collection.
+Listens for SESSION_CDR events. Each session with energy above zero gets
+one CPO invoice, including card and prepaid sessions. OpenCPO calculates the
+VAT. Lago stores the same figures and is retried if it is down.
 
-Durability: the event bus acknowledges a message once the consumer loop
-moves on, so a failed Lago send must not rely on the bus for retry. Every
-billable event is written to ocpp.lago_outbox first, removed only after
-Lago accepts it, and resent by a retry loop. Lago deduplicates on
-transaction_id, so a resend is safe.
+The older usage-event helpers in this file are not called. Calling them
+would bill the same session a second time on a subscription.
 
 Consumer group: "lago-billing"
 """
@@ -256,21 +253,13 @@ async def _deliver(row) -> bool:
 
 
 async def _retry_loop() -> None:
-    """Resend every pending outbox row on a fixed interval."""
-    from state.postgres import db
+    """Create any session invoice that Lago has not accepted yet."""
+    from lago_invoice import ensure_addons, retry_pending
 
     while True:
         try:
-            async with db.read() as conn:
-                rows = await conn.fetch("""
-                    SELECT transaction_id, subscription_id, kwh, event_ts,
-                           charge_point, amount_pence, line
-                      FROM ocpp.lago_outbox
-                  ORDER BY created_at
-                     LIMIT $1
-                """, RETRY_BATCH)
-            for row in rows:
-                await _deliver(row)
+            await ensure_addons()
+            await retry_pending()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -294,8 +283,16 @@ async def run(event_bus: EventBus) -> None:
             "until the key is added."
         )
 
-    await _ensure_outbox()
+    from lago_invoice import deliver_session, ensure_addons, ensure_schema, prepare_session
+
+    await ensure_schema()
+    # The retry loop starts even when Lago is down, so invoices resume
+    # without a process restart.
     asyncio.create_task(_retry_loop(), name="lago-retry")
+    try:
+        await ensure_addons()
+    except Exception as exc:
+        logger.warning("Lago add-ons not ready at start: %s", exc)
 
     async for event in event_bus.consume(
         group=CONSUMER_GROUP,
@@ -303,49 +300,21 @@ async def run(event_bus: EventBus) -> None:
         types={EventType.SESSION_CDR},
     ):
         session_id = event.session_id
-        charge_point = event.charge_point
         kwh = event.data.get("energy_kwh", 0)
 
         if event.simulated:
-            logger.debug(f"Skipping simulated CDR: {session_id}")
+            logger.debug("Skipping simulated CDR: %s", session_id)
             continue
 
         if kwh <= 0:
-            logger.debug(f"Skipping zero-energy CDR: {session_id}")
+            logger.debug("Skipping zero-energy CDR: %s", session_id)
             continue
 
-        resolved = await _resolve_subscription(session_id)
-        if not resolved:
+        prepared = await prepare_session(session_id, kwh)
+        if not prepared:
             logger.info(
-                f"No billable subscription for session {session_id} "
-                f"({charge_point}, {kwh:.3f} kWh) — not sent to Lago"
+                "Session %s is not invoiced (%s, %.3f kWh)",
+                session_id, event.charge_point, kwh,
             )
             continue
-
-        subscription_id, session_row = resolved
-        stored_rate = session_row["session_rate"]
-        if stored_rate is None:
-            stored_rate = session_row["tariff_kwh"]
-        rate = rate_or_fallback(stored_rate)
-        amount_pence = ex_vat_pence(kwh, rate)
-        line = _invoice_line(session_id, session_row)
-
-        # Transaction ID = session_id (idempotent — Lago deduplicates)
-        await _record(
-            transaction_id=session_id,
-            subscription_id=subscription_id,
-            kwh=kwh,
-            timestamp=event.timestamp,
-            charge_point=charge_point,
-            amount_pence=amount_pence,
-            line=line,
-        )
-        await _deliver({
-            "transaction_id": session_id,
-            "subscription_id": subscription_id,
-            "kwh": kwh,
-            "event_ts": event.timestamp,
-            "charge_point": charge_point,
-            "amount_pence": amount_pence,
-            "line": line,
-        })
+        await deliver_session(session_id)

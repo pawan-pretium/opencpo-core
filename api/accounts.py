@@ -16,9 +16,10 @@ from typing import Optional
 
 import bcrypt
 
-from money import ex_vat_amount, incl_vat_amount, rate_or_fallback
+from money import rate_or_fallback, session_cost_pence
 import jwt
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr
 
 from state.postgres import db
@@ -283,9 +284,11 @@ async def get_account_sessions(request: Request, limit: int = 50, offset: int = 
                    ps.payment_status,
                    cp.metadata->>'display_name' AS display_name,
                    cp.metadata->>'address' AS address,
-                   cp.metadata->>'city' AS city
+                   cp.metadata->>'city' AS city,
+                   si.lago_invoice_id
               FROM ocpp.public_sessions ps
          LEFT JOIN ocpp.charge_points   cp ON cp.id = ps.cp_id
+         LEFT JOIN ocpp.session_invoices si ON si.public_session_id = ps.id::text
              WHERE ps.driver_account_id = $1::uuid
              ORDER BY ps.created_at DESC
              LIMIT $2 OFFSET $3
@@ -293,8 +296,13 @@ async def get_account_sessions(request: Request, limit: int = 50, offset: int = 
 
         total_row = await conn.fetchrow("""
             SELECT COUNT(*) AS total,
-                   COALESCE(SUM(kwh_delivered), 0) AS total_kwh,
-                   COALESCE(SUM(kwh_delivered * rate_kwh), 0) AS total_cost
+                   COALESCE(SUM(kwh_delivered), 0) AS total_kwh
+              FROM ocpp.public_sessions
+             WHERE driver_account_id = $1::uuid
+        """, account_id)
+
+        cost_rows = await conn.fetch("""
+            SELECT cp_id, kwh_delivered, rate_kwh
               FROM ocpp.public_sessions
              WHERE driver_account_id = $1::uuid
         """, account_id)
@@ -308,7 +316,7 @@ async def get_account_sessions(request: Request, limit: int = 50, offset: int = 
 
         kwh = float(r["kwh_delivered"]) if r["kwh_delivered"] else 0.0
         rate = float(rate_or_fallback(r["rate_kwh"]))
-        cost = float(incl_vat_amount(ex_vat_amount(kwh, rate)))
+        cost = session_cost_pence(kwh, rate, r["cp_id"]) / 100
 
         sessions.append({
             "id": r["id"],
@@ -325,16 +333,34 @@ async def get_account_sessions(request: Request, limit: int = 50, offset: int = 
             "stopped_at": r["stopped_at"].isoformat() if r["stopped_at"] else None,
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             "payment_status": r["payment_status"],
+            "invoice": bool(r["lago_invoice_id"]),
         })
 
     return {
         "sessions": sessions,
         "total": total_row["total"],
         "total_kwh": round(float(total_row["total_kwh"]), 3),
-        "total_cost": round(float(total_row["total_cost"]), 2),
+        "total_cost": sum(
+            session_cost_pence(row["kwh_delivered"], row["rate_kwh"], row["cp_id"])
+            for row in cost_rows
+        ) / 100,
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.get("/sessions/{session_id}/invoice")
+async def download_session_invoice(session_id: str, request: Request):
+    """The Lago PDF for one of this driver's sessions."""
+    payload = await get_current_account(request)
+    from lago_invoice import invoice_pdf
+
+    pdf = await invoice_pdf(session_id, payload["sub"])
+    if not pdf:
+        raise HTTPException(404, "Invoice not found")
+    return Response(content=pdf, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="invoice-{session_id[:8]}.pdf"',
+    })
 
 
 # ── Management endpoints (API key required, mounted separately) ──────────

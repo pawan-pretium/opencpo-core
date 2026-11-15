@@ -35,6 +35,7 @@ python-dotenv>=1.0.0
 
 # PDF generation
 reportlab>=4.0.0
+Pillow>=10.0.0
 
 # OCPI
 # (no external lib — we implement OCPI 2.2.1 directly)
