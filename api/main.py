@@ -108,9 +108,9 @@ from api.push import router as push_router
 _mgmt = [Depends(management_auth)]  # shorthand for management-only routes
 
 # ── Management endpoints (require MANAGEMENT_API_KEY) ────────────────────
-app.include_router(chargers_router, prefix="/api/v1/chargers", tags=["Chargers"])
+app.include_router(chargers_router, prefix="/api/v1/chargers", tags=["Chargers"], dependencies=_mgmt)
 app.include_router(charger_commands_router, prefix="/api/v1/chargers", tags=["Charger Commands"])
-app.include_router(sessions_router, prefix="/api/v1/sessions", tags=["Sessions"])
+app.include_router(sessions_router, prefix="/api/v1/sessions", tags=["Sessions"], dependencies=_mgmt)
 app.include_router(tariffs_router, prefix="/api/v1/tariffs", tags=["Tariffs"], dependencies=_mgmt)
 app.include_router(tokens_router, prefix="/api/v1/tokens", tags=["Tokens"], dependencies=_mgmt)
 app.include_router(groups_router, prefix="/api/v1/groups", tags=["Groups"], dependencies=_mgmt)
