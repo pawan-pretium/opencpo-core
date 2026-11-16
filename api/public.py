@@ -65,7 +65,8 @@ async def chargers_nearby(
                    (metadata->>'latitude')::float AS latitude,
                    (metadata->>'longitude')::float AS longitude,
                    (metadata->>'max_power_kw')::float AS max_power_kw,
-                   (metadata->>'tariff_kwh')::float AS tariff_kwh
+                   (metadata->>'tariff_kwh')::float AS tariff_kwh,
+                   metadata->>'connector_type' AS connector_type
               FROM ocpp.charge_points
              WHERE (metadata->>'access_type' = 'public' OR metadata->>'access_type' IS NULL)
                AND metadata->>'latitude' IS NOT NULL
@@ -83,7 +84,7 @@ async def chargers_nearby(
                 if key.startswith("connector_") and key.endswith("_status"):
                     conn_id = int(key.split("_")[1])
                     if conn_id > 0:
-                        connectors.append({"id": conn_id, "type": "CCS2", "status": val})
+                        connectors.append({"id": conn_id, "type": r["connector_type"] or "Type 2", "status": val})
 
         energy_rate = 0.50 if r["tariff_kwh"] is None else float(r["tariff_kwh"])
         chargers.append({
