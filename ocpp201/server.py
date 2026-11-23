@@ -96,7 +96,11 @@ class OCPP201Server:
             f"Charger connected: {cp_id} (OCPP 2.0.1)"
             + (f" [client cert: {client_cert.get('subject', 'unknown')}]" if client_cert else "")
         )
+        previous = self._connections.get(cp_id)
         self._connections[cp_id] = websocket
+        if previous is not None and previous is not websocket:
+            logger.info(f"Closing replaced socket for {cp_id}")
+            asyncio.ensure_future(_close_quietly(previous))
 
         try:
             # on_connect handles the message loop
@@ -107,8 +111,13 @@ class OCPP201Server:
         except Exception as e:
             logger.error(f"Error handling {cp_id}: {e}", exc_info=True)
         finally:
-            self._connections.pop(cp_id, None)
-            await self._on_disconnect(cp_id)
+            # A charger that reconnects before its old socket closes owns the
+            # newer socket. The old socket's cleanup must not remove it.
+            if self._connections.get(cp_id) is websocket:
+                self._connections.pop(cp_id, None)
+                await self._on_disconnect(cp_id)
+            else:
+                logger.info(f"Replaced socket for {cp_id} closed; newer connection kept")
 
     async def send_to(self, cp_id: str, message: str) -> bool:
         ws = self._connections.get(cp_id)
@@ -131,3 +140,11 @@ class OCPP201Server:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+
+
+async def _close_quietly(websocket: ServerConnection) -> None:
+    """Close a replaced charger socket. It may already be dead."""
+    try:
+        await websocket.close(1000, "Replaced by a new connection")
+    except Exception:
+        pass

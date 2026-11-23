@@ -27,9 +27,12 @@ class EventBus:
 
     async def connect(self) -> None:
         if self._redis is None:
+            # The consumer blocks on XREADGROUP for consumer_block_ms. The read
+            # timeout must outlast that block, or every idle wait times out.
             self._redis = aioredis.from_url(
                 config.redis.url,
                 decode_responses=False,
+                socket_timeout=config.events.consumer_block_ms / 1000 + 5,
             )
         # Verify connection
         await self._redis.ping()
@@ -155,6 +158,9 @@ class EventBus:
 
             except asyncio.CancelledError:
                 break
+            except aioredis.TimeoutError as e:
+                logger.warning(f"Consumer read timed out ({group}): {e}")
+                await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"Consumer error: {e}", exc_info=True)
                 await asyncio.sleep(1)
