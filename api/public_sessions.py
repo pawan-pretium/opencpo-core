@@ -104,6 +104,13 @@ async def create_session(req: SessionCreate):
     Note: Payment integration is handled by the operator's payment plugin.
     The session starts in 'pending' status; payment plugin updates to 'paid'.
     """
+    # A charger that is not in the database cannot be charged. Refuse before any
+    # write, live-status check or Stripe call.
+    async with db.read() as conn:
+        known = await conn.fetchval("SELECT 1 FROM ocpp.charge_points WHERE id = $1", req.cp_id)
+    if not known:
+        raise HTTPException(404, "Charge point not found")
+
     # A driver with an unpaid session cannot start another one.
     await _refuse_if_unpaid(req.driver_phone, req.driver_email)
 

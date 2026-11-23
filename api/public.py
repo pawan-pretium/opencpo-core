@@ -38,7 +38,15 @@ async def _get_charger_live(cp_id: str) -> dict | None:
 
 @router.get("/qr/{code}/lookup")
 async def qr_lookup(code: str):
-    """Resolve a QR sticker code to a charger + connector."""
+    """Resolve a QR sticker code to a charger + connector.
+
+    A code that matches no charger is refused, so the driver app never shows
+    a charge screen or a payment hold for a charger that does not exist.
+    """
+    async with db.read() as conn:
+        known = await conn.fetchval("SELECT 1 FROM ocpp.charge_points WHERE id = $1", code)
+    if not known:
+        raise HTTPException(404, "QR code is not linked to a charger")
     return {
         "cp_id":       code,
         "connector_id": 1,
