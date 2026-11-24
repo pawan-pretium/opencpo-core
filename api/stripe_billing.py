@@ -103,7 +103,7 @@ async def debt_is_paid(checkout_id: str | None) -> bool:
 
 
 async def _charge_saved_card(row, pence: int) -> dict:
-    return await _stripe("POST", "/payment_intents", {
+    data = {
         "amount": str(pence),
         "currency": "gbp",
         "customer": row["stripe_customer_id"],
@@ -114,7 +114,12 @@ async def _charge_saved_card(row, pence: int) -> dict:
         "metadata[opencpo_session_id]": row["id"],
         "metadata[session_id]": row["id"],
         "metadata[kind]": "final",
-    })
+    }
+    # Stripe emails a receipt when the session has a driver email.
+    email = (row["driver_email"] or "").strip()
+    if email:
+        data["receipt_email"] = email
+    return await _stripe("POST", "/payment_intents", data)
 
 
 async def _email_payment_link(row, pence: int, url: str) -> None:
@@ -231,7 +236,7 @@ async def _payment_link_full(row, pence: int) -> dict:
     """Stripe page for the balance. Returns id and url, or blanks if Stripe refuses."""
     base = _app_url()
     try:
-        session = await _stripe("POST", "/checkout/sessions", {
+        data = {
             "mode": "payment",
             "customer": row["stripe_customer_id"],
             "success_url": f"{base}/receipt/{row['id']}",
@@ -246,7 +251,11 @@ async def _payment_link_full(row, pence: int) -> dict:
             "payment_intent_data[metadata][opencpo_session_id]": row["id"],
             "payment_intent_data[metadata][session_id]": row["id"],
             "payment_intent_data[metadata][kind]": "debt",
-        })
+        }
+        email = (row["driver_email"] or "").strip()
+        if email:
+            data["payment_intent_data[receipt_email]"] = email
+        session = await _stripe("POST", "/checkout/sessions", data)
     except StripeCallError as exc:
         logger.warning("Payment link failed for %s: %s", row["id"][:8], exc)
         return {"id": None, "url": ""}

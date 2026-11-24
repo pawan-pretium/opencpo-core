@@ -20,6 +20,33 @@ from money import session_breakdown
 
 logger = logging.getLogger(__name__)
 
+_SKIP_LAGO_MARKER = "skipped:stripe_ledger_prepaid"
+
+
+def stripe_ledger_for_prepaid() -> bool:
+    """True when the pilot flag skips Lago for prepaid/card sessions."""
+    from config import config
+    return bool(config.stripe_ledger_for_prepaid)
+
+
+def _is_prepaid_card_invoice(row) -> bool:
+    """Driver-app / card path: linked public session, or billing_type prepaid."""
+    try:
+        public_id = row["public_session_id"]
+    except (KeyError, TypeError):
+        public_id = None
+    if public_id:
+        return True
+    try:
+        billing = row["billing_type"]
+    except (KeyError, TypeError):
+        billing = None
+    return (billing or "").strip().lower() == "prepaid"
+
+
+def _skip_lago_copy(row) -> bool:
+    return stripe_ledger_for_prepaid() and _is_prepaid_card_invoice(row)
+
 LAGO_API_URL = os.getenv("LAGO_API_URL", "http://lago-api:3000").rstrip("/")
 ENERGY_ADD_ON = "session_energy"
 FEE_ADD_ON = "connection_fee"
@@ -491,6 +518,24 @@ async def deliver_session(session_id: str) -> bool:
                 session_id,
             )
 
+    if _skip_lago_copy(row):
+        # Pilot: Stripe is the ledger. Do not create or retry a Lago copy.
+        if (row["last_error"] or "") != _SKIP_LAGO_MARKER:
+            async with db.write() as conn:
+                await conn.execute(
+                    """
+                    UPDATE ocpp.session_invoices
+                       SET last_error = $2
+                     WHERE session_id = $1
+                    """,
+                    session_id, _SKIP_LAGO_MARKER,
+                )
+            logger.info(
+                "Lago skipped for prepaid session %s under STRIPE_LEDGER_FOR_PREPAID",
+                session_id,
+            )
+        return True
+
     if row["lago_invoice_id"]:
         if (row["want_paid"] or total == 0) and not row["lago_paid"]:
             await _mark_lago_paid(row["lago_invoice_id"], session_id)
@@ -611,6 +656,14 @@ async def mark_paid_by_session(session_id: str) -> None:
                     session_id,
                 )
         if row["lago_invoice_id"] and not row["lago_paid"]:
+            # Need public_session_id / billing to decide skip; reload minimal fields.
+            async with db.read() as conn:
+                full = await conn.fetchrow(
+                    "SELECT public_session_id FROM ocpp.session_invoices WHERE session_id = $1",
+                    session_id,
+                )
+            if full and _skip_lago_copy(full):
+                return
             await _mark_lago_paid(row["lago_invoice_id"], session_id)
     except Exception as exc:
         logger.warning("Paid mark kept locally for %s: %s", session_id, exc)
@@ -648,6 +701,9 @@ async def mark_paid_for_public_session(public_session_id: str) -> None:
                     row["session_id"],
                 )
         if row["lago_invoice_id"] and not row["lago_paid"]:
+            # Public session = driver card / prepaid path.
+            if stripe_ledger_for_prepaid():
+                return
             await _mark_lago_paid(row["lago_invoice_id"], row["session_id"])
     except Exception as exc:
         logger.warning("Paid mark kept locally for %s: %s", public_session_id, exc)
@@ -718,8 +774,14 @@ async def retry_pending() -> None:
         rows = await conn.fetch(
             """
             SELECT session_id FROM ocpp.session_invoices
-             WHERE lago_invoice_id IS NULL
-                OR (payment_marked AND NOT lago_paid)
+             WHERE (
+                    lago_invoice_id IS NULL
+                    AND COALESCE(last_error, '') <> 'skipped:stripe_ledger_prepaid'
+                   )
+                OR (
+                    payment_marked AND NOT lago_paid
+                    AND lago_invoice_id IS NOT NULL
+                   )
                 OR (NOT emailed AND COALESCE(driver_email, '') <> '')
                 OR (NOT sms_sent AND COALESCE(driver_phone, '') <> '')
              ORDER BY created_at

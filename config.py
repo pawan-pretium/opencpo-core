@@ -158,6 +158,11 @@ class Config:
     @property
     def log_format(self): return _env("LOG_FORMAT", "json")
 
+    @property
+    def stripe_ledger_for_prepaid(self) -> bool:
+        """Pilot: prepaid/card sessions use Stripe only (no Lago copy). Default off."""
+        return _env_bool("STRIPE_LEDGER_FOR_PREPAID", False)
+
 
 # Singleton
 config = Config()
